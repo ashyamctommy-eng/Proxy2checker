@@ -90,7 +90,12 @@ COPY_LINES_PER_MSG = int(_num_env("PC_COPY_LINES", 120, 1, 500))
 COPY_MAX_MSGS = int(_num_env("PC_COPY_MSGS", 3, 1, 20))
 MAX_COPY_LINE = 300
 RECHECK_LIMIT = int(_num_env("PC_RECHECK", 50, 1, 500))
-VAULT_DIR = os.environ.get("PC_VAULT_DIR", "vault")
+# Where the vault lives. `PC_VAULT_DIR` wins if set; otherwise Railway's
+# RAILWAY_VOLUME_MOUNT_PATH (injected automatically when a volume is attached) is
+# used, so attaching a volume is enough — no variable to remember.
+VAULT_DIR = (os.environ.get("PC_VAULT_DIR", "").strip()
+             or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+             or "vault")
 
 STREAM_ENABLED = os.environ.get("PC_STREAM", "1") not in ("0", "false", "no")
 STREAM_MAX = int(_num_env("PC_STREAM_MAX", 20, 0, 50))

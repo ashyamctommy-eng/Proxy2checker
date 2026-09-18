@@ -1,0 +1,21 @@
+# runtime data (SQLite vault + geo cache)
+vault/
+*.db
+*.db-wal
+*.db-shm
+
+# legacy vault artefacts (auto-migrated on first run)
+pool.jsonl
+*.migrated
+
+# outputs
+valid_by_country/
+valid_proxies.txt
+approved.txt
+report.txt
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

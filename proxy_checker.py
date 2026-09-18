@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROXY CHECKER BOT  -  Credits: @Poriot_ke
+PROXY CHECKER  -  Credits: @Poriot_ke
 Fast concurrent proxy checker with live stats & clean .txt export.
 
 Supported input formats (auto-detected, one per line):
@@ -21,102 +21,34 @@ Options:
     --threads N        concurrent workers           (default 200)
     --timeout N        per-proxy timeout seconds     (default 10)
     --out FILE         valid proxies output          (default valid_proxies.txt)
-    --judge URL        IP-echo test URL              (default http://httpbin.org/ip)
+    --judge URL        force a single IP-echo URL    (default: judge pool)
+    --engine MODE      auto | thread | async         (default auto)
+    --no-tcp-gate      disable the TCP reachability gate
+    --geo              also write one file per country (see --geo-out)
+    --geo-out DIR      per-country output directory  (default valid_by_country)
+    --geo-max N        max new exit IPs to geolocate per run (default 2500)
+
+Parsing, the TCP gate and the checking engine live in engine.py and are
+re-exported here so existing imports (`from proxy_checker import parse_proxy`)
+keep working.
 """
 import argparse
 import concurrent.futures as cf
-import ipaddress
 import os
 import re
 import sys
 import time
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 
-import requests
+# re-exported for backwards compatibility
+from engine import (          # noqa: F401
+    PROTOS, parse_proxy, proxy_url, canonical, check_one, check_many,
+    tcp_probe, resolve_engine,
+)
+from judges import JudgePool
 
-# ---------------------------------------------------------------- parsing ----
-PROTOS = ("http", "https", "socks4", "socks5")
-_PROTO_RE = re.compile(r"^(https?|socks4a?|socks5h?)://", re.I)
-
-
-def parse_proxy(line, default_proto="http"):
-    """Return dict {proto, host, port, user, pass, raw} or None if unparseable."""
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-
-    proto = default_proto
-    creds_user = creds_pass = None
-
-    # proto://...
-    m = _PROTO_RE.match(line)
-    if m:
-        proto = m.group(1).lower()
-        proto = {"socks4a": "socks4", "socks5h": "socks5"}.get(proto, proto)
-        rest = line[m.end():]
-    else:
-        rest = line
-
-    # user:pass@host:port
-    if "@" in rest:
-        cred, hostpart = rest.rsplit("@", 1)
-        if ":" in cred:
-            creds_user, creds_pass = cred.split(":", 1)
-        else:
-            creds_user = cred
-        parts = hostpart.split(":")
-    else:
-        parts = rest.split(":")
-
-    # 4-part line without "@" — two layouts exist:
-    #   host:port:user:pass   (e.g. 1.2.3.4:8080:user:pass)
-    #   user:pass:host:port   (e.g. user:pass:1.2.3.4:8080)
-    # A port must be a number, so the digit field disambiguates the layout.
-    if creds_user is None and len(parts) == 4:
-        if parts[1].isdigit() and 0 < int(parts[1]) < 65536:
-            host, port, creds_user, creds_pass = parts            # host:port:user:pass
-        elif parts[3].isdigit() and 0 < int(parts[3]) < 65536:
-            creds_user, creds_pass, host, port = parts            # user:pass:host:port
-        else:
-            host, port = parts[0], parts[1]
-    elif len(parts) >= 2:
-        host, port = parts[0], parts[1]
-    else:
-        return None
-
-    host = host.strip()
-    port = port.strip()
-    if not host or not port.isdigit():
-        return None
-    if not (0 < int(port) < 65536):
-        return None
-
-    return {
-        "proto": proto,
-        "host": host,
-        "port": int(port),
-        "user": creds_user,
-        "pass": creds_pass,
-        "raw": line,
-    }
-
-
-def proxy_url(p, proto=None):
-    proto = proto or p["proto"]
-    scheme = "socks5h" if proto == "socks5" else ("socks4a" if proto == "socks4" else proto)
-    auth = ""
-    if p["user"]:
-        auth = p["user"] + (":" + p["pass"] if p["pass"] else "") + "@"
-    return f"{scheme}://{auth}{p['host']}:{p['port']}"
-
-
-def canonical(p, proto):
-    """Clean output form: proto://[user:pass@]host:port"""
-    auth = ""
-    if p["user"]:
-        auth = p["user"] + (":" + p["pass"] if p["pass"] else "") + "@"
-    return f"{proto}://{auth}{p['host']}:{p['port']}"
+JUDGE_UNREADABLE = "JudgeUnreadable"
 
 
 # ---------------------------------------------------------------- loading ----
@@ -146,37 +78,6 @@ def load_input(paths):
     return lines
 
 
-# ---------------------------------------------------------------- checking ---
-def check_one(p, default_proto, timeout, judge):
-    """Return (ok, proto_used, latency_ms, exit_ip, err)."""
-    protos = PROTOS if default_proto == "auto" else (default_proto,)
-    # If the line itself declared a proto, trust it first.
-    if default_proto == "auto" and _PROTO_RE.match(p["raw"]):
-        protos = (p["proto"],) + tuple(x for x in PROTOS if x != p["proto"])
-
-    last_err = ""
-    for proto in protos:
-        url = proxy_url(p, proto)
-        proxies = {"http": url, "https": url}
-        try:
-            t0 = time.time()
-            r = requests.get(judge, proxies=proxies, timeout=timeout,
-                             headers={"User-Agent": "proxy-checker/1.0"})
-            if r.status_code == 200:
-                latency = (time.time() - t0) * 1000
-                ip = ""
-                try:
-                    ip = r.json().get("origin", "")
-                except Exception:
-                    m = re.search(r"\d+\.\d+\.\d+\.\d+", r.text)
-                    ip = m.group(0) if m else ""
-                return True, proto, latency, ip, ""
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = type(e).__name__
-    return False, None, None, None, last_err
-
-
 def bar(done, total, width=30):
     filled = int(width * done / total) if total else width
     return "[" + "#" * filled + "-" * (width - filled) + "]"
@@ -190,7 +91,14 @@ def main():
     ap.add_argument("--threads", type=int, default=200)
     ap.add_argument("--timeout", type=int, default=10)
     ap.add_argument("--out", default="valid_proxies.txt")
-    ap.add_argument("--judge", default="http://httpbin.org/ip")
+    ap.add_argument("--judge", default=None,
+                    help="force one IP-echo URL instead of the judge pool")
+    ap.add_argument("--engine", default="auto", choices=["auto", "thread", "async"])
+    ap.add_argument("--no-tcp-gate", action="store_true")
+    ap.add_argument("--geo", action="store_true",
+                    help="write valid proxies grouped by exit-IP country")
+    ap.add_argument("--geo-out", default="valid_by_country")
+    ap.add_argument("--geo-max", type=int, default=2500)
     args = ap.parse_args()
 
     raw_lines = load_input(args.inputs)
@@ -207,41 +115,76 @@ def main():
         parsed.append(p)
 
     total = len(parsed)
+    backend = resolve_engine(args.engine)
+    pool = None if args.judge else JudgePool(timeout=min(args.timeout, 8))
     print("=" * 50)
     print("  PROXY CHECKER BOT   -   @Poriot_ke")
     print("=" * 50)
     print(f"  Loaded     : {len(raw_lines)} lines")
     print(f"  Valid fmt  : {total} unique  |  Bad/skipped: {bad}")
     print(f"  Protocol   : {args.proto}   Threads: {args.threads}   Timeout: {args.timeout}s")
+    print(f"  Engine     : {backend}   TCP gate: {'off' if args.no_tcp_gate else 'on'}")
     print("=" * 50)
     if total == 0:
         print("No parseable proxies. Nothing to check.")
         return
 
     results, done, t_start = [], 0, time.time()
-    with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futs = {ex.submit(check_one, p, args.proto, args.timeout, args.judge): p
-                for p in parsed}
-        for fut in cf.as_completed(futs):
-            p = futs[fut]
-            ok, proto, latency, ip, err = fut.result()
-            if ok:
-                results.append((p, proto, latency, ip))
-            done += 1
-            if done % 5 == 0 or done == total:
-                elapsed = time.time() - t_start
-                cpm = int(done / elapsed * 60) if elapsed else 0
-                sys.stdout.write(
-                    f"\r{bar(done, total)} {done}/{total}  "
-                    f"valid:{len(results)}  CPM:{cpm}   ")
-                sys.stdout.flush()
+    last_print = [0.0]
+
+    def on_result(idx, p, res, n_done, n_total):
+        nonlocal done
+        done = n_done
+        if res[0]:
+            results.append((p, res[1], res[2], res[3]))
+        now = time.time()
+        if now - last_print[0] > 0.3 or n_done == n_total:
+            last_print[0] = now
+            elapsed = now - t_start
+            cpm = int(n_done / elapsed * 60) if elapsed else 0
+            remaining = (n_total - n_done) / (n_done / elapsed) if n_done and elapsed else 0
+            sys.stdout.write(
+                f"\r{bar(n_done, n_total)} {n_done}/{n_total}  "
+                f"valid:{len(results)}  CPM:{cpm}  ETA:{remaining:.0f}s   ")
+            sys.stdout.flush()
+
+    check_many(parsed, proto=args.proto, timeout=args.timeout,
+               judge=args.judge, judge_pool=pool, threads=args.threads,
+               on_result=on_result, engine=args.engine,
+               tcp_gate=not args.no_tcp_gate)
     print()
 
     # speed-sorted
-    results.sort(key=lambda r: r[2])
+    results.sort(key=lambda r: r[2] if r[2] is not None else 9e9)
     with open(args.out, "w") as fh:
         for p, proto, latency, ip in results:
             fh.write(p["raw"] + "\n")
+
+    # optional: group the valid proxies by exit-IP country
+    if args.geo and results:
+        try:
+            from geoip import GeoDB, flag_emoji
+            db = GeoDB(os.path.join(args.geo_out, "geo_cache.json"))
+            ips = [(ip or "").split(",")[0].strip() for _, _, _, ip in results]
+            info = db.lookup(ips, max_uncached=args.geo_max)
+            groups = defaultdict(list)
+            for p, proto, latency, ip in results:
+                key = (ip or "").split(",")[0].strip()
+                cc = (info.get(key) or {}).get("cc", "ZZ")
+                groups[cc].append((p["raw"], latency))
+            os.makedirs(args.geo_out, exist_ok=True)
+            summary = []
+            for cc, rows in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                if not re.fullmatch(r"[A-Z]{2}", str(cc)):
+                    cc = "ZZ"          # never let a provider value name a file
+                rows.sort(key=lambda r: r[1] if r[1] is not None else 9e9)
+                with open(os.path.join(args.geo_out, f"{cc}.txt"), "w") as fh:
+                    fh.write("\n".join(raw for raw, _ in rows) + "\n")
+                summary.append(f"{flag_emoji(cc)} {cc}={len(rows)}")
+            print("  By country: " + ", ".join(summary))
+            print(f"  Per-country files -> {args.geo_out}/<CC>.txt")
+        except Exception as e:
+            print(f"  (geo lookup failed: {type(e).__name__}: {e})")
 
     elapsed = time.time() - t_start
     by_proto = Counter(r[1] for r in results)

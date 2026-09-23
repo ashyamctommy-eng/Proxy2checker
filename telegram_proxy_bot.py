@@ -53,6 +53,7 @@ from judges import JudgePool, extract_ip
 from geoip import (GeoDB, GeoPipeline, clean_ip, flag_emoji,
                    UNKNOWN_CC, UNKNOWN_NAME, NO_IP_CC, NO_IP_NAME)
 from vault import Vault
+import access
 import formats
 import ui
 from ui import btn, get_view, set_view, reset_view, toggle, view_header, \
@@ -85,6 +86,9 @@ ENGINE_MODE = os.environ.get("PC_ENGINE", "thread")      # thread | async | auto
 MAX_PROXIES = int(_num_env("PC_MAX", 20000, 1, 500000))
 GEO_ENABLED = os.environ.get("PC_GEO", "1") not in ("0", "false", "no")
 GEO_MAX = int(_num_env("PC_GEO_MAX", 2500, 0, 100000))
+GEO_TTL_DAYS = int(_num_env("PC_GEO_TTL_DAYS", 7, 1, 365))
+# per-scan cap on second-provider spot checks (0 disables)
+GEO_VERIFY = int(_num_env("PC_GEO_VERIFY_MAX", 30, 0, 2000))
 PAGE_SIZE = int(_num_env("PC_PAGE", 6, 1, 24))
 COPY_LINES_PER_MSG = int(_num_env("PC_COPY_LINES", 120, 1, 500))
 COPY_MAX_MSGS = int(_num_env("PC_COPY_MSGS", 3, 1, 20))
@@ -114,7 +118,7 @@ OK_FILE = "approved.txt"
 REPORT_FILE = "report.txt"
 
 VAULT = Vault(VAULT_DIR)
-GEO = GeoDB(VAULT.geo_path)
+GEO = GeoDB(VAULT.geo_path, ttl_days=GEO_TTL_DAYS, verify_max=GEO_VERIFY)
 JUDGES = JudgePool(timeout=min(TIMEOUT, 8))
 QUEUE = JobQueue(max_jobs=MAX_JOBS, global_threads=GLOBAL_THREADS,
                  min_threads=max(8, GLOBAL_THREADS // (MAX_JOBS * 2)))
@@ -145,8 +149,8 @@ BANNER = (
     "<b>Protocols:</b> HTTP · HTTPS · SOCKS4 · SOCKS5\n"
     "<b>Accepts:</b> 📄 .txt · 📦 .zip · 💬 paste\n\n"
     "<b>Status tags</b> — every valid proxy is classified:\n"
-    "✔ <code>OK</code> anonymous · 🚩 <code>TRANSPARENT</code> (leaks your IP) · "
-    "⚠ <code>FLAGGED</code>\n\n"
+    "🔒 <code>OK</code> anonymous · 🚩 <code>TRANSPARENT</code> (leaks your IP) · "
+    "⚠ <code>FLAGGED</code> · ❔ <code>UNKNOWN</code> (leak not verifiable)\n\n"
     "<b>Country sorting</b> — each proxy is geolocated by its exit IP, saved to "
     "the vault, then offered per country behind colored buttons:\n"
     "🟢 big share · 🟡 medium · 🟠 small · 🔴 tiny\n\n"
@@ -154,7 +158,9 @@ BANNER = (
     "100 ms → 100 · 3 s → 0 · 🔒 ×1.0 · 🚩 ×0.6 · ⚠ ×0.35\n\n"
     "<b>Commands:</b> <code>/start</code> · <code>/mpx</code> · "
     "<code>/countries</code> · <code>/vault</code> · <code>/pool</code> · "
-    "<code>/cancel</code>\n"
+    "<code>/redeem KEY</code> · <code>/cancel</code>\n"
+    "<i>Admins:</i> <code>/genkeys n [uses] [days]</code> · <code>/keys</code> · "
+    "<code>/users</code> · <code>/grant id [days]</code> · <code>/revoke id</code>\n"
     "📢 Dev: @nativecodes\n"
     "<i>Reply to an uploaded file with /mpx to begin</i> ↓"
 )
@@ -466,9 +472,10 @@ def notify_edit(chat_id, msg_id, text, markup=None):
 
 # ------------------------------------------------------------------ views ----
 def records_for(chat_id, scan_id):
-    """(records, label) for a saved scan or the all-time pool; (None, None) if gone."""
+    """(records, label) for a saved scan or *this chat's* pool; (None, None) if gone."""
     if scan_id in ("pool", "P"):
-        return VAULT.load_pool(), "all-time pool"
+        # Per-chat: this must never return another chat's proxies.
+        return VAULT.load_pool(chat_id), "your all-time pool"
     data = VAULT.load_scan(chat_id, scan_id)
     if not data:
         return None, None
@@ -826,6 +833,7 @@ def _run_job(chat_id, lines, threads=None):
         msg_id = (m.get("result") or {}).get("message_id")
 
     # ---- geo resolved *while* checking (slice 3) ---------------------------
+    geo_disagreements_before = GEO.disagreements
     pipeline = GeoPipeline(GEO, max_uncached=GEO_MAX).start() if GEO_ENABLED else None
 
     results, done, t0, last_edit = [], 0, time.time(), 0.0
@@ -903,6 +911,14 @@ def _run_job(chat_id, lines, threads=None):
                         "is unavailable, so anonymous/transparent is unverified "
                         "(shown as ❔ UNKNOWN).")
         judge_warning = f"{judge_warning}\n{anon_warning}" if judge_warning else anon_warning
+    disputed = GEO.disagreements - geo_disagreements_before
+    if disputed > 0:
+        # Two providers disagreed on these IPs; we refused to guess, so they are
+        # ❔ Unknown instead of a confidently wrong country.
+        geo_warning = (f"❔ {disputed} IP(s) were dropped to Unknown because two "
+                       f"geolocation providers disagreed — better Unknown than "
+                       f"a wrong country.")
+        judge_warning = f"{judge_warning}\n{geo_warning}" if judge_warning else geo_warning
 
     scan_id = new_scan_id()
     meta = {"total": total, "valid": len(records), "elapsed": round(elapsed, 1),
@@ -910,7 +926,7 @@ def _run_job(chat_id, lines, threads=None):
     saved = False
     try:
         VAULT.save_scan(chat_id, scan_id, records, meta)
-        VAULT.push_pool(records)
+        VAULT.push_pool(records, chat_id)
         saved = True
     except Exception as e:
         print("vault err", e)
@@ -1128,7 +1144,7 @@ def _recheck(chat_id, scan_id, cc, limit=RECHECK_LIMIT):
 
     try:
         VAULT.update_records(scan_id, updated)
-        VAULT.push_pool([u for u in updated if u["st"] != "DEAD"])
+        VAULT.push_pool([u for u in updated if u["st"] != "DEAD"], chat_id)
     except Exception as e:
         print("recheck save err", e)
 
@@ -1151,8 +1167,12 @@ def handle_callback(cb):
     cid = (cb.get("message") or {}).get("chat", {}).get("id")
     msg_id = (cb.get("message") or {}).get("message_id")
     data = cb.get("data", "") or ""
-    api("answerCallbackQuery", callback_query_id=cb["id"])
-    if not cid:
+    frm = cb.get("from") or {}
+    allowed, reason = access.check(VAULT, frm.get("id"))
+    api("answerCallbackQuery",
+        callback_query_id=cb["id"],
+        **({} if allowed else {"text": "\U0001f512 Ask the operator for a redeem key"}))
+    if not cid or not allowed:
         return
 
     if data in ("noop",):
@@ -1239,16 +1259,16 @@ def _queue_recheck(chat_id, scan_id, cc):
 # --------------------------------------------------------------- commands ----
 def show_vault(chat_id):
     scans = VAULT.list_scans(chat_id, limit=5)
-    pool = VAULT.pool_size()
-    pool_countries = len(VAULT.pool_countries())
+    pool = VAULT.pool_size(chat_id)
+    pool_countries = len(VAULT.pool_countries(chat_id))
     lines = ["💾 <b>Vault</b>", ""]
     rows = []
     if pool:
-        lines.append(f"🌍 All-time pool: <b>{pool}</b> proxies across "
+        lines.append(f"🌍 Your all-time pool: <b>{pool}</b> proxies across "
                      f"<b>{pool_countries}</b> countries")
-        rows.append(ui.row(btn(f"🌍 Browse all-time pool ({pool})", "P")))
+        rows.append(ui.row(btn(f"🌍 Browse your pool ({pool})", "P")))
     else:
-        lines.append("🌍 All-time pool: empty")
+        lines.append("🌍 Your pool: empty")
 
     if scans:
         lines += ["", "🗂 <b>Recent scans</b> (tap to reopen)"]
@@ -1272,7 +1292,7 @@ def latest_scan_id(chat_id):
     scans = VAULT.list_scans(chat_id, limit=1)
     if scans:
         return scans[0].get("scan_id")
-    if VAULT.pool_size():
+    if VAULT.pool_size(chat_id):
         return "pool"
     return None
 
@@ -1293,6 +1313,87 @@ def _start_job(chat_id, lines):
         notify(chat_id, f"⏳ Another scan is running — queued (position {pos}).")
 
 
+def _arg_ints(stripped, n, defaults):
+    """Parse up to n integer args after the command, falling back per position."""
+    parts = stripped.split()[1:]
+    out = list(defaults)
+    for i in range(min(n, len(parts))):
+        try:
+            out[i] = int(parts[i])
+        except ValueError:
+            pass
+    return out
+
+
+def _handle_admin(chat_id, stripped, uid):
+    """Admin-only commands: /genkeys, /keys, /grant, /revoke, /users, /geoclear."""
+    cmd = stripped.split()[0]
+
+    if cmd.startswith("/geoclear"):
+        n = GEO.clear()
+        send(chat_id, f"\U0001f9f9 Cleared <b>{n}</b> cached country answer(s). "
+                      f"IPs already in saved scans keep their stored country; "
+                      f"re-run a scan (or \U0001f501 Re-verify) to resolve them fresh.")
+        return
+
+    if cmd.startswith("/genkeys"):
+        count, uses, days = _arg_ints(stripped, 3, (1, 1, 0))
+        keys = VAULT.create_keys(count, uses=uses, days=days or None,
+                                 created_by=uid)
+        body = "\n".join(f"<code>{k}</code>" for k in keys)
+        span = f"{days} day(s) of access" if days else "access with no expiry"
+        send(chat_id, f"\U0001f511 <b>{len(keys)} redeem key(s)</b> · "
+                      f"{uses} use(s) each · {span}\n\n{body}\n\n"
+                      f"Share with users; they send <code>/redeem &lt;key&gt;</code>.")
+        return
+
+    if cmd.startswith("/keys"):
+        rows = VAULT.list_keys()
+        if not rows:
+            send(chat_id, "No keys yet — <code>/genkeys 1</code> to mint one.")
+            return
+        lines = []
+        for r in rows:
+            state = "revoked" if r["revoked"] else f"{r['uses']}/{r['max_uses']} used"
+            days = f"{r['grant_days']}d access" if r["grant_days"] else "no expiry"
+            lines.append(f"<code>{r['key']}</code> · {state} · {days}")
+        send(chat_id, "\U0001f511 <b>Redeem keys</b>\n" + "\n".join(lines))
+        return
+
+    if cmd.startswith("/grant"):
+        parts = stripped.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            send(chat_id, "Usage: <code>/grant &lt;user_id&gt; [days]</code>")
+            return
+        days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        VAULT.grant_access(parts[1], days=days, via="admin", note=str(uid))
+        send(chat_id, f"\u2705 Granted access to <code>{parts[1]}</code>"
+                      + (f" for {days} day(s)." if days else " (no expiry)."))
+        return
+
+    if cmd.startswith("/revoke"):
+        parts = stripped.split()
+        if len(parts) < 2:
+            send(chat_id, "Usage: <code>/revoke &lt;user_id&gt;</code>")
+            return
+        n = VAULT.revoke_access(parts[1])
+        send(chat_id, f"\u2705 Revoked {n} user(s)." if n else "Not found.")
+        return
+
+    if cmd.startswith("/users"):
+        rows = VAULT.list_users()
+        if not rows:
+            send(chat_id, "No users have access yet.")
+            return
+        lines = []
+        for r in rows:
+            until = time.strftime("%Y-%m-%d", time.localtime(r["expires_at"])) \
+                if r["expires_at"] else "never"
+            lines.append(f"<code>{r['user_id']}</code> · via {r['via']} · until {until}")
+        send(chat_id, "\U0001f464 <b>Users with access</b>\n" + "\n".join(lines))
+        return
+
+
 def handle_update(upd):
     cb = upd.get("callback_query")
     if cb:
@@ -1305,6 +1406,30 @@ def handle_update(upd):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "") or msg.get("caption", "")
     stripped = text.strip()
+    uid = access.sender_id(msg)
+
+    allowed, _why = access.check(VAULT, uid)
+    if not allowed and not stripped.startswith("/redeem"):
+        send(chat_id, access.DENIED_TEXT)
+        return
+
+    if stripped.startswith("/redeem"):
+        arg = stripped[len("/redeem"):].strip()
+        ok, note = VAULT.redeem_key(arg, uid)
+        if ok:
+            send(chat_id, f"{note}\n\nSend /start to begin.")
+        else:
+            send(chat_id, note)
+        return
+
+    if stripped.startswith("/genkeys") or stripped.startswith("/keys") \
+            or stripped.startswith("/revoke") or stripped.startswith("/grant") \
+            or stripped.startswith("/users") or stripped.startswith("/geoclear"):
+        if not access.is_admin(uid):
+            send(chat_id, "\u26d4 Admins only.")
+            return
+        _handle_admin(chat_id, stripped, uid)
+        return
 
     if stripped.startswith("/start") or stripped.startswith("/help"):
         send(chat_id, BANNER)
@@ -1330,8 +1455,8 @@ def handle_update(upd):
         return
 
     if stripped == "/pool":
-        if not VAULT.pool_size():
-            send(chat_id, "📭 The all-time pool is empty — run a scan first.")
+        if not VAULT.pool_size(chat_id):
+            send(chat_id, "📭 Your pool is empty — run a scan first.")
             return
         _show_keypad(chat_id, "pool", 0)
         return
@@ -1393,6 +1518,11 @@ def main():
     print(f"vault={VAULT_DIR} ({VAULT.pool_size()} pooled) · engine={resolve_engine(ENGINE_MODE)} "
           f"· geo={'on' if GEO_ENABLED else 'off'} · jobs={MAX_JOBS} · "
           f"threads={GLOBAL_THREADS}")
+    if access.enabled():
+        print(f"access: restricted to {len(access.ADMIN_IDS)} admin id(s) "
+              f"(PC_ADMIN_IDS) · {len(VAULT.list_users())} user(s) granted")
+    else:
+        print(access.OPEN_WARNING)
     JUDGES.check_health_async()
     # No drop_pending_updates: the default is false, and passing the *string*
     # "false" risked being coerced truthy (silently discarding updates) or being

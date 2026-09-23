@@ -32,12 +32,14 @@ os.environ["NO_PROXY"] = ""
 
 import telegram_proxy_bot as bot      # noqa: E402
 import engine                          # noqa: E402
+import access                          # noqa: E402
 import ui                              # noqa: E402
 import formats                         # noqa: E402
 import vault as vault_mod              # noqa: E402
 from vault import Vault                # noqa: E402
 from jobs import JobQueue              # noqa: E402
 from judges import JudgePool, extract_ip   # noqa: E402
+from geoip import GeoDB                # noqa: E402
 from geoip import (GeoDB, GeoPipeline, clean_ip, flag_emoji, is_public_ip,  # noqa: E402
                    UNKNOWN_CC, NO_IP_CC)
 
@@ -546,21 +548,21 @@ class VaultTests(unittest.TestCase):
 
     def test_pool_upsert_keeps_fastest_and_newest(self):
         self.v.push_pool([{"raw": "1.1.1.1:80", "lat": 300, "cc": "US",
-                           "proto": "http", "ip": "8.8.8.8", "st": "OK"}])
+                           "proto": "http", "ip": "8.8.8.8", "st": "OK"}], CHAT)
         self.v.push_pool([{"raw": "1.1.1.1:80", "lat": 120, "cc": "US",
                            "proto": "http", "ip": "8.8.8.8", "st": "OK"},
                           {"raw": "2.2.2.2:80", "lat": 90, "cc": "DE",
-                           "proto": "http", "ip": "5.6.7.8", "st": "OK"}])
-        pool = {r["raw"]: r for r in self.v.load_pool()}
+                           "proto": "http", "ip": "5.6.7.8", "st": "OK"}], CHAT)
+        pool = {r["raw"]: r for r in self.v.load_pool(CHAT)}
         self.assertEqual(len(pool), 2)
         self.assertEqual(pool["1.1.1.1:80"]["lat"], 120)
 
     def test_pool_tie_prefers_newest(self):
         self.v.push_pool([{"raw": "a:1", "lat": 300, "cc": "US", "proto": "http",
-                           "ip": "8.8.8.8", "st": "OK"}])
+                           "ip": "8.8.8.8", "st": "OK"}], CHAT)
         self.v.push_pool([{"raw": "a:1", "lat": 300, "cc": "KE", "proto": "http",
-                           "ip": "8.8.8.8", "st": "OK"}])
-        self.assertEqual(self.v.load_pool()[0]["cc"], "KE")
+                           "ip": "8.8.8.8", "st": "OK"}], CHAT)
+        self.assertEqual(self.v.load_pool(CHAT)[0]["cc"], "KE")
 
     def test_update_records_for_recheck(self):
         self.v.save_scan(4242, "beef1234",
@@ -578,9 +580,9 @@ class VaultTests(unittest.TestCase):
         self.v.push_pool([
             {"raw": "a:1", "lat": 10.0, "cc": "US", "proto": "http", "ip": "8.8.8.8", "st": "OK"},
             {"raw": "b:1", "lat": 20.0, "cc": "US", "proto": "http", "ip": "8.8.4.4", "st": "OK"},
-            {"raw": "c:1", "lat": 30.0, "cc": "DE", "proto": "http", "ip": "5.6.7.8", "st": "OK"}])
-        self.assertEqual(self.v.pool_countries()["US"], 2)
-        self.assertEqual(len(self.v.load_pool(cc="DE")), 1)
+            {"raw": "c:1", "lat": 30.0, "cc": "DE", "proto": "http", "ip": "5.6.7.8", "st": "OK"}], CHAT)
+        self.assertEqual(self.v.pool_countries(CHAT)["US"], 2)
+        self.assertEqual(len(self.v.load_pool(CHAT, cc="DE")), 1)
 
 
 class VaultRegressionTests(unittest.TestCase):
@@ -617,8 +619,8 @@ class VaultRegressionTests(unittest.TestCase):
         try:
             self.v.push_pool([{"raw": f"p{i}:1", "lat": float(i), "cc": "US",
                                "proto": "http", "ip": "8.8.8.8", "st": "OK"}
-                              for i in range(20)])
-            self.assertEqual(self.v.pool_size(), 5)
+                              for i in range(20)], CHAT)
+            self.assertEqual(self.v.pool_size(CHAT), 5)
         finally:
             vault_mod.POOL_MAX_UNIQUE = old
 
@@ -638,7 +640,9 @@ class VaultRegressionTests(unittest.TestCase):
                                     "country": "Germany", "sc": 70}]}, fh)
         v1 = Vault(root)
         self.assertEqual(v1.pool_size(), 1)
-        self.assertEqual(v1.load_pool()[0]["lat"], 90)
+        # legacy pool.jsonl rows are unattributable, so they land in the
+        # no-owner bucket and are invisible to every real chat
+        self.assertEqual(v1.load_pool(vault_mod.POOL_LEGACY_CHAT)[0]["lat"], 90)
         self.assertIsNotNone(v1.load_scan("77", "abcdef01"))
         v2 = Vault(root)
         self.assertEqual(v2.pool_size(), 1, "import must not duplicate")
@@ -1050,7 +1054,7 @@ class BotFlowTests(unittest.TestCase):
         before = len(self.tg.messages)
         bot.handle_update({"message": {"chat": {"id": CHAT}, "text": "/vault"}})
         vault_msgs = self.tg.messages[before:]
-        self.assertTrue(any("All-time pool" in t for _, _, t, _ in vault_msgs))
+        self.assertTrue(any("Your all-time pool" in t for _, _, t, _ in vault_msgs))
         cbs = [b.get("callback_data", "") for b in buttons(vault_msgs[-1][3])]
         self.assertIn("P", cbs)
         bot.handle_update({"message": {"chat": {"id": CHAT}, "text": "/pool"}})
@@ -1564,6 +1568,215 @@ class AutonomyHardeningTests(unittest.TestCase):
         src = inspect.getsource(engine._check_async)
         self.assertNotIn("not socks_async_available()", src)
         self.assertIn('if one_proto in ("socks4", "socks5"):', src)
+
+
+class PoolIsolationTests(unittest.TestCase):
+    """The all-time pool is per chat: one user must never see another's proxies."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pooliso-", dir=TMP)
+        self.v = Vault(self.dir)
+
+    @staticmethod
+    def rec(raw, cc):
+        return {"raw": raw, "lat": 10.0, "cc": cc, "proto": "http",
+                "ip": "8.8.8.8", "st": "OK", "country": cc}
+
+    def test_pool_is_scoped_per_chat(self):
+        self.v.push_pool([self.rec("a:1", "US")], "chatA")
+        self.v.push_pool([self.rec("b:1", "DE")], "chatB")
+        self.assertEqual([r["raw"] for r in self.v.load_pool("chatA")], ["a:1"])
+        self.assertEqual([r["raw"] for r in self.v.load_pool("chatB")], ["b:1"])
+        self.assertEqual(self.v.pool_size("chatA"), 1)
+        self.assertEqual(self.v.pool_size("chatB"), 1)
+        self.assertEqual(self.v.pool_countries("chatA"), {"US": 1})
+
+    def test_same_proxy_in_two_chats_does_not_collide(self):
+        self.v.push_pool([self.rec("same:1", "US")], "chatA")
+        self.v.push_pool([self.rec("same:1", "DE")], "chatB")
+        self.assertEqual(self.v.pool_size("chatA"), 1)
+        self.assertEqual(self.v.pool_size("chatB"), 1)
+        self.assertEqual(self.v.load_pool("chatA")[0]["cc"], "US")
+        self.assertEqual(self.v.load_pool("chatB")[0]["cc"], "DE")
+
+    def test_pre_isolation_pool_is_migrated_to_the_no_owner_bucket(self):
+        import sqlite3
+        root = tempfile.mkdtemp(prefix="oldpool-", dir=TMP)
+        conn = sqlite3.connect(os.path.join(root, "vault.db"))
+        conn.executescript(
+            "CREATE TABLE pool (raw TEXT PRIMARY KEY, proto TEXT, lat REAL, ip TEXT,"
+            " st TEXT, cc TEXT, country TEXT, sc INTEGER, ts INTEGER);"
+            "INSERT INTO pool VALUES ('1.1.1.1:80','http',100,'8.8.8.8','OK','US',"
+            "'United States',90,1);")
+        conn.commit()
+        conn.close()
+        v = Vault(root)
+        # unattributable legacy rows must not become visible to any chat
+        self.assertEqual(v.pool_size("12345"), 0)
+        self.assertEqual(v.load_pool(vault_mod.POOL_LEGACY_CHAT)[0]["raw"], "1.1.1.1:80")
+
+    def test_legacy_pool_jsonl_is_scoped_to_the_no_owner_bucket(self):
+        root = tempfile.mkdtemp(prefix="legacypool-", dir=TMP)
+        with open(os.path.join(root, "pool.jsonl"), "w") as fh:
+            fh.write(json.dumps({"raw": "1.1.1.1:80", "lat": 50, "cc": "US",
+                                 "proto": "http", "ip": "8.8.8.8", "st": "OK"}) + "\n")
+        v = Vault(root)
+        self.assertEqual(v.pool_size("42"), 0)
+        self.assertEqual(v.pool_size(vault_mod.POOL_LEGACY_CHAT), 1)
+
+
+class LegacyMigrationRobustnessTests(unittest.TestCase):
+    def test_malformed_pool_jsonl_does_not_crash_startup(self):
+        """A line that is valid JSON but not an object used to raise
+        AttributeError out of Vault.__init__ and crash-loop the bot."""
+        root = tempfile.mkdtemp(prefix="badpool-", dir=TMP)
+        with open(os.path.join(root, "pool.jsonl"), "w") as fh:
+            fh.write("null\n")
+            fh.write("5\n")
+            fh.write('"just a string"\n')
+            fh.write("{not json at all\n")
+            fh.write(json.dumps({"raw": "1.1.1.1:80", "lat": 50, "cc": "US",
+                                 "proto": "http", "ip": "8.8.8.8", "st": "OK"}) + "\n")
+        v = Vault(root)          # must not raise
+        self.assertEqual(v.pool_size(vault_mod.POOL_LEGACY_CHAT), 1)
+
+    def test_non_object_legacy_scan_file_is_skipped(self):
+        root = tempfile.mkdtemp(prefix="badscan-", dir=TMP)
+        os.makedirs(os.path.join(root, "scans", "9"), exist_ok=True)
+        with open(os.path.join(root, "scans", "9", "deadbeef.json"), "w") as fh:
+            json.dump(["not", "a", "dict"], fh)
+        v = Vault(root)          # must not raise
+        self.assertIsNone(v.load_scan("9", "deadbeef"))
+
+
+class AccessTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="access-", dir=TMP)
+        self.v = Vault(self.dir)
+
+    def test_key_lifecycle_and_use_limit(self):
+        keys = self.v.create_keys(1, uses=2, days=30, created_by="admin")
+        self.assertEqual(len(keys), 1)
+        key = keys[0]
+        self.assertTrue(vault_mod.valid_redeem_key(key))
+        ok, _ = self.v.redeem_key(key, "u1")
+        self.assertTrue(ok)
+        self.assertIsNotNone(self.v.access_entry("u1"))
+        self.assertTrue(self.v.redeem_key(key, "u2")[0])
+        ok, msg = self.v.redeem_key(key, "u3")
+        self.assertFalse(ok, "a 2-use key must stop after 2 redemptions")
+        self.assertIn("used up", msg)
+
+    def test_unknown_and_revoked_keys_are_rejected(self):
+        ok, _ = self.v.redeem_key("PC-AAAA-BBBB-CCCC", "u1")
+        self.assertFalse(ok)
+        key = self.v.create_keys(1)[0]
+        self.assertEqual(self.v.revoke_key(key), 1)
+        ok, msg = self.v.redeem_key(key, "u2")
+        self.assertFalse(ok)
+        self.assertIn("revoked", msg)
+
+    def test_keys_are_unique_and_unambiguous(self):
+        keys = self.v.create_keys(40)
+        self.assertEqual(len(set(keys)), 40)
+        for k in keys:
+            self.assertTrue(vault_mod.valid_redeem_key(k))
+            self.assertFalse(set(k) & set("01OI"), f"{k} has an ambiguous character")
+
+    def test_expired_grant_is_dropped_on_read(self):
+        self.v.grant_access("u9", days=-1)
+        self.assertIsNone(self.v.access_entry("u9"))
+
+    def test_grant_and_revoke(self):
+        self.v.grant_access("u5", days=30)
+        self.assertIsNotNone(self.v.access_entry("u5"))
+        self.assertEqual(self.v.revoke_access("u5"), 1)
+        self.assertIsNone(self.v.access_entry("u5"))
+
+    def test_policy_admins_always_allowed_and_enforcement_opt_in(self):
+        original = access.ADMIN_IDS
+        try:
+            access.ADMIN_IDS = {"77"}
+            self.assertTrue(access.enabled())
+            self.assertEqual(access.check(self.v, "77"), (True, "admin"))
+            self.assertFalse(access.check(self.v, "99")[0])
+            self.v.grant_access("99", days=1)
+            self.assertTrue(access.check(self.v, "99")[0])
+            # no admins configured -> bot stays open (a deploy cannot brick itself)
+            access.ADMIN_IDS = set()
+            self.assertFalse(access.enabled())
+            self.assertTrue(access.check(self.v, "anyone")[0])
+        finally:
+            access.ADMIN_IDS = original
+
+    def test_parse_admins_accepts_commas_semicolons_and_spaces(self):
+        self.assertEqual(access.parse_admins("1,2; 3  4"), {"1", "2", "3", "4"})
+        self.assertEqual(access.parse_admins(""), set())
+
+
+class GeoAccuracyTests(unittest.TestCase):
+    """A wrong exit IP is a wrong country - and a confidently wrong country is
+    worse than an honest Unknown."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="geoacc-", dir=TMP)
+
+    def test_error_pages_never_yield_an_exit_ip(self):
+        # these used to hand back the CDN's address, which then geolocated to US
+        self.assertEqual(extract_ip("<html>Attention Required! 104.16.0.1</html>"), "")
+        self.assertEqual(extract_ip("<html><body>Blocked. Write to 3.5.140.1</body></html>"), "")
+        self.assertEqual(extract_ip("<html><body>503 Service Unavailable</body></html>"), "")
+        self.assertEqual(extract_ip('{"status":"fail"}'), "")
+
+    def test_impossible_exit_addresses_are_rejected(self):
+        for bad in ('{"ip":"127.0.0.1"}', '{"ip":"169.254.10.1"}',
+                    '{"ip":"0.0.0.0"}', '{"ip":"224.0.0.1"}'):
+            self.assertEqual(extract_ip(bad), "", bad)
+
+    def test_real_judge_shapes_still_parse(self):
+        self.assertEqual(extract_ip('{"origin":"1.1.1.1, 2.2.2.2"}'), "1.1.1.1")
+        self.assertEqual(extract_ip('{"ip":"8.8.8.8"}'), "8.8.8.8")
+        self.assertEqual(extract_ip('{"query":"41.90.64.1"}'), "41.90.64.1")
+        self.assertEqual(extract_ip("8.8.4.4"), "8.8.4.4")
+        self.assertEqual(extract_ip('{"address":"2001:4860:4860::8888"}'),
+                         "2001:4860:4860::8888")
+
+    def test_provider_disagreement_is_reported_as_unknown_not_guessed(self):
+        db = GeoDB(os.path.join(self.dir, "d.json"), verify_max=5)
+        db._batch = lambda ips: {ip: {"cc": "US", "country": "United States"}
+                                 for ip in ips}
+        db._single = lambda ip: {"cc": "CA", "country": "Canada"}
+        info = db.lookup(["8.8.8.8"], max_uncached=5)
+        self.assertEqual(info["8.8.8.8"]["cc"], "ZZ",
+                         "must not assert a country two providers disagree on")
+        self.assertEqual(db.disagreements, 1)
+        self.assertFalse(db.is_cached("8.8.8.8"),
+                         "a disputed answer must not be cached")
+
+    def test_agreement_is_kept_and_cached_with_context(self):
+        db = GeoDB(os.path.join(self.dir, "a.json"), verify_max=5)
+        db._batch = lambda ips: {ip: {"cc": "CA", "country": "Canada",
+                                      "city": "Toronto", "isp": "Example ISP"}
+                                 for ip in ips}
+        db._single = lambda ip: {"cc": "CA", "country": "Canada"}
+        info = db.lookup(["1.1.1.1"], max_uncached=5)
+        self.assertEqual(info["1.1.1.1"]["cc"], "CA")
+        self.assertTrue(db.is_cached("1.1.1.1"))
+        self.assertEqual(db._cache["1.1.1.1"]["city"], "Toronto")
+
+    def test_expired_cache_entries_are_pruned_on_save(self):
+        db = GeoDB(os.path.join(self.dir, "p.json"), ttl_days=1)
+        db._store("8.8.8.8", "US", "United States")
+        db._cache["8.8.8.8"]["ts"] = int(time.time()) - 10 * 86400
+        db.dirty = True
+        db.save()
+        self.assertEqual(len(db._cache), 0, "expired entries must not persist forever")
+
+    def test_clear_wipes_the_cache(self):
+        db = GeoDB(os.path.join(self.dir, "c.json"))
+        db._store("8.8.8.8", "US", "United States")
+        self.assertEqual(db.clear(), 1)
+        self.assertEqual(len(db._cache), 0)
 
 
 class RealNetworkSmokeTest(unittest.TestCase):

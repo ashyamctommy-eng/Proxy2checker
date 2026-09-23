@@ -34,9 +34,26 @@ import glob
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
+
+# Redeem keys are bearer credentials: use `secrets`, and an alphabet with no
+# 0/O/1/I so a key can be read aloud or retyped without ambiguity.
+KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+KEY_RE = re.compile(r"^PC(-[A-Z2-9]{4}){3}$")
+
+
+def new_redeem_key() -> str:
+    groups = ["".join(secrets.choice(KEY_ALPHABET) for _ in range(4))
+              for _ in range(3)]
+    return "PC-" + "-".join(groups)
+
+
+def valid_redeem_key(key) -> bool:
+    return bool(isinstance(key, str) and KEY_RE.match(key.strip().upper()))
+
 
 SCAN_INDEX_KEEP = 25           # scans kept per chat (older ones are deleted)
 POOL_MAX_UNIQUE = 200_000      # hard cap on distinct proxies in the pool
@@ -70,8 +87,12 @@ CREATE TABLE IF NOT EXISTS records (
 );
 CREATE INDEX IF NOT EXISTS ix_records_scan ON records(scan_id);
 CREATE INDEX IF NOT EXISTS ix_records_cc   ON records(scan_id, cc);
+-- scans are always queried per chat and pruned per chat; without this index
+-- every save and every prune does a full scan plus a temp B-tree sort.
+CREATE INDEX IF NOT EXISTS ix_scans_chat   ON scans(chat_id, ts DESC);
 CREATE TABLE IF NOT EXISTS pool (
-    raw     TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL DEFAULT '',
+    raw     TEXT NOT NULL,
     proto   TEXT,
     lat     REAL,
     ip      TEXT,
@@ -79,15 +100,43 @@ CREATE TABLE IF NOT EXISTS pool (
     cc      TEXT,
     country TEXT,
     sc      INTEGER,
-    ts      INTEGER
+    ts      INTEGER,
+    PRIMARY KEY (chat_id, raw)
 );
-CREATE INDEX IF NOT EXISTS ix_pool_lat ON pool(lat);
-CREATE INDEX IF NOT EXISTS ix_pool_cc  ON pool(cc);
+CREATE INDEX IF NOT EXISTS ix_pool_chat_lat ON pool(chat_id, lat);
+CREATE INDEX IF NOT EXISTS ix_pool_chat_cc  ON pool(chat_id, cc);
+-- access control: who may use the bot, and the redeem keys that grant access
+CREATE TABLE IF NOT EXISTS access (
+    user_id    TEXT PRIMARY KEY,
+    via        TEXT,
+    granted_at INTEGER,
+    expires_at INTEGER,
+    note       TEXT
+);
+CREATE TABLE IF NOT EXISTS redeem_keys (
+    key        TEXT PRIMARY KEY,
+    created_at INTEGER,
+    created_by TEXT,
+    max_uses   INTEGER NOT NULL DEFAULT 1,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER,
+    grant_days INTEGER,
+    revoked    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_keys_revoked ON redeem_keys(revoked, created_at DESC);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
+# The all-time pool used to be global (one row per proxy, shared by every chat),
+# which meant any chat could browse every other chat's proxies - including their
+# credentials. Rows are now scoped per chat; a row with chat_id = '' is legacy
+# data from before the change, which belongs to nobody and is therefore visible
+# to nobody (admins can still see it via /poolstats).
+POOL_LEGACY_CHAT = ""
+
 _RECORD_FIELDS = ("raw", "proto", "lat", "ip", "st", "cc", "country", "sc")
-POOL_FIELDS = ("raw", "proto", "lat", "ip", "st", "cc", "country", "sc", "ts")
+POOL_FIELDS = ("chat_id", "raw", "proto", "lat", "ip", "st", "cc", "country",
+               "sc", "ts")
 
 
 def valid_scan_id(scan_id) -> bool:
@@ -111,9 +160,32 @@ class Vault:
         self._write_lock = threading.RLock()
         os.makedirs(root, exist_ok=True)
         with self._write_lock:
-            self._conn().executescript(_SCHEMA)
-            self._conn().commit()
+            conn = self._conn()
+            # Migrate the old pool shape FIRST: _SCHEMA now indexes a `chat_id`
+            # column, and creating those indexes against a pre-isolation pool
+            # would fail with "no such column".
+            self._migrate_pool_to_chat_scoped(conn)
+            conn.executescript(_SCHEMA)
+            conn.commit()
             self._migrate_legacy()
+
+    def _migrate_pool_to_chat_scoped(self, conn) -> None:
+        """Upgrade a pre-isolation `pool` table (raw PRIMARY KEY) in place.
+
+        Existing rows cannot be attributed to a chat, so they are kept under
+        POOL_LEGACY_CHAT ('') where no user-facing query can reach them.
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(pool)")}
+        if not cols or "chat_id" in cols:
+            return
+        conn.execute("ALTER TABLE pool RENAME TO pool_pre_isolation")
+        conn.executescript(_SCHEMA)
+        conn.execute(
+            "INSERT INTO pool (chat_id, raw, proto, lat, ip, st, cc, country, sc, ts) "
+            "SELECT ?, raw, proto, lat, ip, st, cc, country, sc, ts "
+            "FROM pool_pre_isolation", (POOL_LEGACY_CHAT,))
+        conn.execute("DROP TABLE pool_pre_isolation")
+        conn.commit()
 
     # ------------------------------------------------------------ plumbing --
     def _conn(self) -> sqlite3.Connection:
@@ -238,12 +310,17 @@ class Vault:
                 raise
 
     # ---------------------------------------------------------------- pool --
-    def push_pool(self, records: list) -> int:
-        """Upsert working proxies into the all-time pool. Returns rows sent."""
+    def push_pool(self, records: list, chat_id=None) -> int:
+        """Upsert working proxies into this chat's all-time pool.
+
+        The pool is strictly per-chat: a proxy one user found is never visible
+        to another user.
+        """
         if not records:
             return 0
+        owner = str(chat_id) if chat_id is not None else POOL_LEGACY_CHAT
         now = int(time.time())
-        rows = [(str(r.get("raw", "")), r.get("proto"), r.get("lat"), r.get("ip"),
+        rows = [(owner, str(r.get("raw", "")), r.get("proto"), r.get("lat"), r.get("ip"),
                  r.get("st"), r.get("cc"), r.get("country"), r.get("sc"), now)
                 for r in records if r.get("raw")]
         if not rows:
@@ -254,41 +331,201 @@ class Vault:
             try:
                 # fastest wins; on a tie, the newer observation wins
                 conn.executemany(
-                    "INSERT INTO pool (raw, proto, lat, ip, st, cc, country, sc, ts) "
-                    "VALUES (?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(raw) DO UPDATE SET "
+                    "INSERT INTO pool (chat_id, raw, proto, lat, ip, st, cc, country, sc, ts) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(chat_id, raw) DO UPDATE SET "
                     "  proto=excluded.proto, lat=excluded.lat, ip=excluded.ip, "
                     "  st=excluded.st, cc=excluded.cc, country=excluded.country, "
                     "  sc=excluded.sc, ts=excluded.ts "
                     "WHERE (excluded.lat IS NOT NULL AND "
                     "        (pool.lat IS NULL OR excluded.lat <= pool.lat))",
                     rows)
-                conn.execute(
-                    "DELETE FROM pool WHERE raw IN ("
-                    "  SELECT raw FROM pool ORDER BY "
-                    "    CASE WHEN lat IS NULL THEN 1e18 ELSE lat END DESC "
-                    "  LIMIT max(0, (SELECT COUNT(*) FROM pool) - ?))",
-                    (POOL_MAX_UNIQUE,))
+                # Only enforce the cap when the chat is actually near it: the
+                # delete is an unindexed sort, and running it on every scan for
+                # a pool of 40 rows was pure overhead.
+                n = conn.execute("SELECT COUNT(*) AS n FROM pool WHERE chat_id=?",
+                                 (owner,)).fetchone()["n"]
+                if n >= POOL_MAX_UNIQUE:
+                    conn.execute(
+                        "DELETE FROM pool WHERE chat_id=? AND rowid IN ("
+                        "  SELECT rowid FROM pool WHERE chat_id=? ORDER BY "
+                        "    CASE WHEN lat IS NULL THEN 1e18 ELSE lat END DESC "
+                        "  LIMIT ?)",
+                        (owner, owner, n - POOL_MAX_UNIQUE))
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
                 raise
         return len(rows)
 
-    def load_pool(self, cc=None) -> list:
+    def load_pool(self, chat_id, cc=None) -> list:
+        """This chat's pooled proxies only. `chat_id` is required on purpose."""
+        owner = str(chat_id)
         conn = self._conn()
         if cc:
-            rows = conn.execute("SELECT * FROM pool WHERE cc=? ORDER BY lat", (cc,))
+            rows = conn.execute(
+                "SELECT * FROM pool WHERE chat_id=? AND cc=? ORDER BY lat", (owner, cc))
         else:
-            rows = conn.execute("SELECT * FROM pool ORDER BY lat")
+            rows = conn.execute(
+                "SELECT * FROM pool WHERE chat_id=? ORDER BY lat", (owner,))
         return [{k: row[k] for k in POOL_FIELDS} for row in rows]
 
-    def pool_size(self) -> int:
-        return self._conn().execute("SELECT COUNT(*) AS n FROM pool").fetchone()["n"]
+    def pool_size(self, chat_id=None) -> int:
+        if chat_id is None:
+            return self._conn().execute(
+                "SELECT COUNT(*) AS n FROM pool").fetchone()["n"]
+        return self._conn().execute(
+            "SELECT COUNT(*) AS n FROM pool WHERE chat_id=?",
+            (str(chat_id),)).fetchone()["n"]
 
-    def pool_countries(self) -> dict:
-        return {r["cc"] or "ZZ": r["n"] for r in self._conn().execute(
-            "SELECT cc, COUNT(*) AS n FROM pool GROUP BY cc ORDER BY n DESC")}
+    def pool_countries(self, chat_id=None) -> dict:
+        conn = self._conn()
+        if chat_id is None:
+            return {r["cc"] or "ZZ": r["n"] for r in conn.execute(
+                "SELECT cc, COUNT(*) AS n FROM pool GROUP BY cc ORDER BY n DESC")}
+        return {r["cc"] or "ZZ": r["n"] for r in conn.execute(
+            "SELECT cc, COUNT(*) AS n FROM pool WHERE chat_id=? "
+            "GROUP BY cc ORDER BY n DESC", (str(chat_id),))}
+
+    # -------------------------------------------------------------- access --
+    # Access control lives in the same SQLite file as everything else so it
+    # survives restarts on an ephemeral filesystem (Railway/Heroku need the
+    # volume mount for this to persist).
+    def grant_access(self, user_id, days=None, via="admin", note="") -> None:
+        now = int(time.time())
+        expires = now + int(days) * 86400 if days else None
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "INSERT INTO access (user_id, via, granted_at, expires_at, note) "
+                    "VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET via=excluded.via, "
+                    "  granted_at=excluded.granted_at, expires_at=excluded.expires_at, "
+                    "  note=excluded.note",
+                    (str(user_id), via, now, expires, note))
+                conn.execute("COMMIT")
+            except Exception:
+                self._safe_rollback(conn)
+                raise
+
+    def revoke_access(self, user_id) -> int:
+        with self._write_lock:
+            conn = self._conn()
+            n = conn.execute("DELETE FROM access WHERE user_id=?",
+                             (str(user_id),)).rowcount
+            conn.commit()
+        return n
+
+    def access_entry(self, user_id):
+        """Row for a user, or None. Expired entries are dropped."""
+        row = self._conn().execute(
+            "SELECT * FROM access WHERE user_id=?", (str(user_id),)).fetchone()
+        if not row:
+            return None
+        if row["expires_at"] and row["expires_at"] < time.time():
+            self.revoke_access(user_id)
+            return None
+        return dict(row)
+
+    def list_users(self, limit: int = 50) -> list:
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM access ORDER BY granted_at DESC LIMIT ?", (limit,))]
+
+    def create_keys(self, count: int = 1, uses: int = 1, days=None,
+                    created_by="", key_days=None) -> list:
+        """Mint `count` redeem keys. Returns the new key strings."""
+        count = max(1, min(int(count), 100))
+        uses = max(1, min(int(uses), 10_000))
+        now = int(time.time())
+        key_expiry = now + int(key_days) * 86400 if key_days else None
+        made = []
+        with self._write_lock:
+            conn = self._conn()
+            for _ in range(count):
+                for _attempt in range(10):
+                    key = new_redeem_key()
+                    try:
+                        conn.execute(
+                            "INSERT INTO redeem_keys (key, created_at, created_by, "
+                            "max_uses, uses, expires_at, grant_days, revoked) "
+                            "VALUES (?,?,?,?,0,?,?,0)",
+                            (key, now, str(created_by), uses, key_expiry,
+                             int(days) if days else None))
+                        made.append(key)
+                        break
+                    except sqlite3.IntegrityError:
+                        continue          # astronomically unlikely; just retry
+            conn.commit()
+        return made
+
+    def redeem_key(self, key, user_id):
+        """Redeem `key` for `user_id` -> (ok, message). Single transaction."""
+        clean = (key or "").strip().upper()
+        if not clean:
+            return False, "Usage: <code>/redeem PC-XXXX-XXXX-XXXX</code>"
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")   # serialise concurrent redemptions
+            try:
+                row = conn.execute(
+                    "SELECT * FROM redeem_keys WHERE key=?", (clean,)).fetchone()
+                if not row:
+                    conn.execute("ROLLBACK")
+                    return False, "❌ That key is not valid."
+                if row["revoked"]:
+                    conn.execute("ROLLBACK")
+                    return False, "❌ That key has been revoked."
+                if row["expires_at"] and row["expires_at"] < time.time():
+                    conn.execute("ROLLBACK")
+                    return False, "❌ That key has expired."
+                if row["uses"] >= row["max_uses"]:
+                    conn.execute("ROLLBACK")
+                    return False, "❌ That key has already been used up."
+                now = int(time.time())
+                days = row["grant_days"]
+                conn.execute("UPDATE redeem_keys SET uses = uses + 1 WHERE key=?",
+                             (clean,))
+                conn.execute(
+                    "INSERT INTO access (user_id, via, granted_at, expires_at, note) "
+                    "VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET via=excluded.via, "
+                    "  granted_at=excluded.granted_at, expires_at=excluded.expires_at, "
+                    "  note=excluded.note",
+                    (str(user_id), "key", now,
+                     now + int(days) * 86400 if days else None, clean))
+                conn.execute("COMMIT")
+            except Exception:
+                self._safe_rollback(conn)
+                raise
+        left = max(0, row["max_uses"] - (row["uses"] + 1))
+        span = f"{days} day(s)" if days else "no expiry"
+        return True, f"✅ Access granted ({span}). Uses left on that key: {left}."
+
+    def list_keys(self, limit: int = 30) -> list:
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM redeem_keys ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+    def revoke_key(self, key) -> int:
+        with self._write_lock:
+            conn = self._conn()
+            n = conn.execute("UPDATE redeem_keys SET revoked=1 WHERE key=?",
+                             ((key or "").strip().upper(),)).rowcount
+            conn.commit()
+        return n
+
+    @staticmethod
+    def _safe_rollback(conn) -> None:
+        """Rollback must not mask the original error (SQLite may have already
+        auto-rolled back, e.g. on SQLITE_FULL)."""
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     # ----------------------------------------------------------- migration --
     def _migrate_legacy(self) -> None:
@@ -309,7 +546,10 @@ class Vault:
                             row = json.loads(line)
                         except ValueError:
                             continue
-                        if not row.get("raw"):
+                        # a line can be valid JSON yet not an object (null, 5,
+                        # "x"); row.get() on those used to raise AttributeError
+                        # straight out of Vault.__init__ and crash-loop the bot
+                        if not isinstance(row, dict) or not row.get("raw"):
                             continue
                         prev = best.get(row["raw"])
                         if prev is None or _pool_sort_key(row) <= _pool_sort_key(prev):
@@ -317,8 +557,11 @@ class Vault:
                 if best:
                     self.push_pool(list(best.values()))
                     imported += len(best)
-            except OSError:
-                pass
+            except OSError as e:
+                # Do NOT rename/skip the file: an I/O failure means we did not
+                # import it, and renaming it to .migrated would lose the data.
+                print("vault: legacy pool import failed:", type(e).__name__, e)
+                return
             _rename(legacy_pool)
 
         for path in glob.glob(os.path.join(self.root, "scans", "*", "*.json")):
@@ -328,6 +571,8 @@ class Vault:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
             except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
                 continue
             scan_id = data.get("scan_id")
             chat_id = data.get("chat_id")

@@ -46,13 +46,20 @@ import time
 
 import requests
 
-BATCH_URL = "http://ip-api.com/batch?fields=status,message,country,countryCode,query"
+BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,countryCode,"
+             "query,regionName,city,isp,as")
 BATCH_SIZE = 100
 BATCH_CALLS_PER_MIN = 13           # provider allows 15/min; stay under it
 SINGLE_URL = "https://ipwho.is/{ip}"
 SINGLE_CALLS_PER_MIN = 40          # ipwho.is free-ish limit
 FALLBACK_MAX = 20                  # per-IP fallback budget (bounds wall-clock)
-CACHE_TTL_DAYS = 30
+CACHE_TTL_DAYS = 7                 # was 30: a reassigned IP kept a stale country
+                                   # (and a wrongly-resolved one kept it) for a month
+# Cross-provider verification of newly resolved IPs. There is no free second
+# *batch* source (tried ipwho.is, geojs, freeipapi, ipapi.co), so this is
+# per-IP and must stay small: it exists to catch a systematically wrong primary
+# provider, not to re-resolve everything.
+VERIFY_MAX = 30                    # per lookup() call, 0 disables
 HTTP_TIMEOUT = 20
 
 # country code used for "we could not place this IP"
@@ -108,14 +115,21 @@ def is_public_ip(ip: str) -> bool:
 class GeoDB:
     """Disk-cached IP -> country resolver (thread safe)."""
 
-    def __init__(self, cache_path: str, ttl_days: int = CACHE_TTL_DAYS):
+    def __init__(self, cache_path: str, ttl_days: int = CACHE_TTL_DAYS,
+                 verify_max: int = VERIFY_MAX):
         self.cache_path = cache_path
         self.ttl = ttl_days * 86400
+        self.verify_max = max(0, int(verify_max))
         self._lock = threading.Lock()
         self._batch_calls = collections.deque()
         self._single_calls = collections.deque()
         self._cache = self._load()
         self.dirty = False
+        # observability: how often the two providers disagreed this run
+        self.disagreements = 0
+        self.verified = 0
+        self.last_disagreements: list = []
+        self.pruned_last = 0
 
     # -- cache persistence ---------------------------------------------------
     def _load(self) -> dict:
@@ -130,6 +144,15 @@ class GeoDB:
         with self._lock:
             if not self.dirty:
                 return
+            # Drop expired entries instead of rewriting them forever: the old
+            # code kept every IP it had ever resolved (and every deterministic
+            # non-public key) in the file for good, and re-serialised the whole
+            # cache on every batch.
+            now = time.time()
+            before = len(self._cache)
+            self._cache = {ip: e for ip, e in self._cache.items()
+                           if now - e.get("ts", 0) <= self.ttl}
+            self.pruned_last = before - len(self._cache)
             directory = os.path.dirname(os.path.abspath(self.cache_path))
             os.makedirs(directory, exist_ok=True)
             tmp = self.cache_path + ".tmp"
@@ -140,6 +163,15 @@ class GeoDB:
                 self.dirty = False
             except OSError:
                 pass
+
+    def clear(self) -> int:
+        """Forget every cached answer (used to recover from poisoned data)."""
+        with self._lock:
+            n = len(self._cache)
+            self._cache = {}
+            self.dirty = True
+        self.save()
+        return n
 
     def _cached(self, ip: str):
         with self._lock:
@@ -153,13 +185,22 @@ class GeoDB:
         # skipped/failed lookup, not a real answer — let it be queried again.
         if cc == UNKNOWN_CC and is_public_ip(ip):
             return None
-        return {"cc": cc, "country": entry.get("country", UNKNOWN_NAME)}
+        out = {"cc": cc, "country": entry.get("country", UNKNOWN_NAME)}
+        for extra in ("region", "city", "isp"):
+            if entry.get(extra):
+                out[extra] = entry[extra]
+        return out
 
-    def _store(self, ip: str, cc: str, country: str) -> None:
+    def _store(self, ip: str, cc: str, country: str, extra: dict | None = None) -> None:
         with self._lock:
-            self._cache[ip] = {"cc": cc or UNKNOWN_CC,
-                               "country": country or UNKNOWN_NAME,
-                               "ts": int(time.time())}
+            entry = {"cc": cc or UNKNOWN_CC,
+                     "country": country or UNKNOWN_NAME,
+                     "ts": int(time.time())}
+            for key in ("region", "city", "isp"):
+                val = (extra or {}).get(key)
+                if val:
+                    entry[key] = str(val)[:80]
+            self._cache[ip] = entry
             self.dirty = True
 
     # -- rate limiting -------------------------------------------------------
@@ -201,7 +242,10 @@ class GeoDB:
                 continue
             if row.get("status") == "success" and row.get("countryCode"):
                 out[ip] = {"cc": str(row["countryCode"]).upper(),
-                           "country": row.get("country") or UNKNOWN_NAME}
+                           "country": row.get("country") or UNKNOWN_NAME,
+                           "region": row.get("regionName") or "",
+                           "city": row.get("city") or "",
+                           "isp": row.get("isp") or row.get("as") or ""}
         return out
 
     def _single(self, ip: str):
@@ -263,17 +307,51 @@ class GeoDB:
         total = len(query)
 
         done = 0
+        batch_resolved: set = set()
         for i in range(0, total, BATCH_SIZE):
             chunk = query[i:i + BATCH_SIZE]
-            resolved.update(self._batch(chunk))
+            got = self._batch(chunk)
+            batch_resolved |= set(got)
+            resolved.update(got)
             done += len(chunk)
             if progress and total:
                 progress(min(done, total), total)
         if progress and total:
             progress(total, total)          # guarantee a 100% tick
 
-        # bounded per-IP fallback for whatever the batch call missed
-        missing = [ip for ip in query if ip not in resolved]
+        # Bounded cross-provider verification. A confidently *wrong* country is
+        # worse than an honest Unknown, so when the second provider disagrees we
+        # drop the answer: this scan shows Unknown, and nothing is cached, so a
+        # later scan can resolve it again.
+        self.last_disagreements = []
+        disputed: set = set()
+        if self.verify_max:
+            checked = 0
+            for ip in query:
+                if checked >= self.verify_max:
+                    break
+                if ip not in batch_resolved:
+                    continue
+                info = resolved.get(ip)
+                if not info:
+                    continue
+                checked += 1
+                second = self._single(ip)
+                if not second:
+                    continue
+                self.verified += 1
+                if second["cc"] != info["cc"]:
+                    self.disagreements += 1
+                    self.last_disagreements.append(
+                        (ip, info["cc"], second["cc"]))
+                    resolved.pop(ip, None)
+                    batch_resolved.discard(ip)
+                    disputed.add(ip)
+
+        # bounded per-IP fallback for whatever the batch call missed (a disputed
+        # IP is deliberately not re-resolved here: putting it back would undo the
+        # whole point of the check)
+        missing = [ip for ip in query if ip not in resolved and ip not in disputed]
         for ip in missing[:FALLBACK_MAX]:
             got = self._single(ip)
             if got:
@@ -286,7 +364,7 @@ class GeoDB:
                 result[ip] = {"cc": UNKNOWN_CC, "country": UNKNOWN_NAME}
                 continue
             result[ip] = info
-            self._store(ip, info["cc"], info["country"])
+            self._store(ip, info["cc"], info["country"], info)
         for ip in skipped:
             result.setdefault(ip, {"cc": UNKNOWN_CC, "country": UNKNOWN_NAME})
         for ip, info in resolved.items():

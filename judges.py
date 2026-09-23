@@ -44,6 +44,11 @@ DEFAULT_JUDGES = (
 
 _UA = {"User-Agent": "proxy-checker/1.0 (+judge)"}
 _IP_CANDIDATE = re.compile(r"[0-9a-fA-F:.]{3,45}")
+# Keys a well-behaved IP-echo endpoint uses. The pool only contains endpoints
+# that return one of these (or a bare IP as the whole body).
+_JSON_KEYS = ("ip", "origin", "query", "address", "client_ip", "IPv4")
+# An address a judge should never hand back as a *proxy's* exit IP.
+_MAX_PLAIN_BODY = 120
 
 
 def _canon_ip(value) -> str:
@@ -57,11 +62,44 @@ def _canon_ip(value) -> str:
         return ""
 
 
+def _plausible_exit_ip(ip: str) -> str:
+    """'' unless `ip` could actually be a proxy's public exit address.
+
+    Deliberately does NOT exclude `is_private`/documentation ranges (tests and
+    some lab setups use them); it only rejects things that are never a real
+    exit: loopback, link-local, unspecified, multicast and reserved.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return ""
+    if (addr.is_loopback or addr.is_link_local or addr.is_unspecified
+            or addr.is_multicast or addr.is_reserved):
+        return ""
+    return ip
+
+
+def _exit_ip(value) -> str:
+    return _plausible_exit_ip(_canon_ip(value))
+
+
 def extract_ip(text) -> str:
-    """Pull the exit IP out of a judge response (JSON or plain text)."""
+    """Pull the exit IP out of a judge response (JSON or plain text).
+
+    Strict on purpose. The old version scanned the whole body for the first
+    IP-looking token, which meant a judge that answered with an HTML error page
+    or a Cloudflare challenge handed back the *CDN's* address as the proxy's
+    exit IP - and geolocation then reported that CDN's country (typically US)
+    for every affected proxy. A wrong exit IP is a wrong country, so when the
+    body is not recognisable we return '' (the caller reports JudgeUnreadable)
+    rather than guess.
+    """
     if not text:
         return ""
     body = text.strip()
+    if not body:
+        return ""
+
     data = None
     if body[:1] in "{[":
         try:
@@ -70,23 +108,34 @@ def extract_ip(text) -> str:
             data = None
 
     if isinstance(data, dict):
-        for key in ("ip", "origin", "query", "address", "client_ip", "IPv4"):
-            ip = _canon_ip(data.get(key))
+        for key in _JSON_KEYS:
+            ip = _exit_ip(data.get(key))
             if ip:
                 return ip
-    elif isinstance(data, list):
+        return ""                  # valid JSON we cannot read is a judge fault
+    if isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
-                for key in ("ip", "origin", "query", "address"):
-                    ip = _canon_ip(item.get(key))
+                for key in _JSON_KEYS:
+                    ip = _exit_ip(item.get(key))
                     if ip:
                         return ip
+        return ""
 
-    for match in _IP_CANDIDATE.finditer(body):
-        ip = _canon_ip(match.group(0))
-        if ip:
-            return ip
-    return ""
+    # Plain text. Markup means an error page / interstitial: never harvest it.
+    if "<" in body:
+        return ""
+    bare = body.strip().strip('"').strip("'").strip()
+    ip = _exit_ip(bare)
+    if ip:
+        return ip
+    # Tolerate a short labelled answer ("Your IP: 1.2.3.4"), but only when the
+    # body yields exactly one distinct address - ambiguous bodies are refused.
+    if len(body) > _MAX_PLAIN_BODY:
+        return ""
+    found = {v for v in (_exit_ip(m.group(0))
+                         for m in _IP_CANDIDATE.finditer(body)) if v}
+    return found.pop() if len(found) == 1 else ""
 
 
 class JudgePool:

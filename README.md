@@ -50,7 +50,8 @@ Proxy2checker/
 ├── ui.py                   # inline-button formatting, filter views, filtering
 ├── formats.py             # export formats (ip:port / url / json / …)
 ├── jobs.py                 # bounded, per-chat-serialised job queue
-├── tests/                  # 92 offline tests (mock proxy + stubbed API)
+├── access.py               # admin list + redeem-key access policy
+├── tests/                  # 126 offline tests (mock proxy + stubbed API)
 ├── requirements.txt        # requests + PySocks (aiohttp optional)
 ├── Procfile.txt            # Heroku worker process definition
 └── railway.json            # Railway deploy config (Nixpacks)
@@ -122,8 +123,20 @@ python3 telegram_proxy_bot.py
 | `/mpx` | Reply to an uploaded `.txt` / `.zip` to start checking |
 | `/countries` | Re-open the country keypad for the most recent scan |
 | `/vault` | Browse saved scans + the all-time country pool |
-| `/pool` | Country keypad over every proxy ever found |
+| `/pool` | Country keypad over **your own** pooled proxies |
+| `/redeem KEY` | Redeem an access key (private bots only) |
 | `/cancel` | Drop scans queued behind the running one |
+
+**Admin-only** (ids listed in `PC_ADMIN_IDS`):
+
+| Command | What it does |
+|---|---|
+| `/genkeys n [uses] [days]` | Mint `n` redeem keys; each grants `days` of access (0 = never expires) |
+| `/keys` | List keys with their use counts and state |
+| `/users` | List users who have access, and until when |
+| `/grant <user_id> [days]` | Grant a user access directly |
+| `/revoke <user_id>` | Remove a user's access |
+| `/geoclear` | Flush the country cache (see *Country accuracy*) |
 
 ### What a scan looks like
 
@@ -162,7 +175,7 @@ Top 30 of 421
 | Component | Rule |
 |---|---|
 | Speed | log scale — `100 ms → 100`, `3 s → 0` |
-| Anonymity | `🔒 OK ×1.0` · `🚩 TRANSPARENT ×0.6` (leaks your IP) · `⚠ FLAGGED ×0.35` |
+| Anonymity | `🔒 OK ×1.0` · `❔ UNKNOWN ×0.75` (not verifiable) · `🚩 TRANSPARENT ×0.6` (leaks your IP) · `⚠ FLAGGED ×0.35` |
 
 **3. Filter / sort bar** — the report carries its own controls; ✅ marks what's active:
 
@@ -206,7 +219,10 @@ Special buckets: `🚫 no exit IP` (proxy answered, judge gave no IP) and `🌐 
 | `PC_MAX` | `20000` | Max proxies checked per job |
 | `PC_GEO` | `1` | `0` disables country lookup |
 | `PC_GEO_MAX` | `2500` | Max *new* exit IPs geolocated per scan |
-| `PC_VAULT_DIR` | `vault` | SQLite + geo cache location |
+| `PC_GEO_TTL_DAYS` | `7` | How long a cached country answer is trusted |
+| `PC_GEO_VERIFY_MAX` | `30` | Per-scan second-provider spot checks (0 disables) |
+| `PC_ADMIN_IDS` | *(empty)* | Comma-separated Telegram **user** ids. Setting this **switches on access control** |
+| `PC_VAULT_DIR` | `vault` | SQLite + geo cache location (holds users and keys too) |
 | `PC_STREAM` | `1` | `0` reverts to a single progress bar |
 | `PC_STREAM_MAX` | `20` | Up to this many proxies → one message each (capped at 50) |
 | `PC_STREAM_EDIT` | `1.2` | Seconds between feed re-renders (≥1.0) |
@@ -218,15 +234,101 @@ Special buckets: `🚫 no exit IP` (proxy answered, judge gave no IP) and `🌐 
 | `PC_COPY_LINES` / `PC_COPY_MSGS` | `120` / `3` | Copy-block sizing |
 | `PC_CHANNEL` / `PC_DEV` | `t.me/nativecodes` / `t.me/Poriot_ke` | Button targets — link, `@name`, or numeric chat ID |
 
+## Access control
+
+The bot is open to anyone who finds it until you set `PC_ADMIN_IDS` to your
+Telegram **user id** (get it from [@userinfobot](https://t.me/userinfobot)).
+Setting it switches enforcement on: admins keep full access, everyone else must
+redeem a key.
+
+```
+PC_ADMIN_IDS=123456789            # comma-separate for several admins
+```
+
+Then, from the admin account:
+
+```
+/genkeys 5 1 30     # 5 single-use keys, each granting 30 days
+/keys               # see use counts and state
+/users              # who has access, until when
+/revoke 987654321   # remove someone
+```
+
+A user sends `/redeem PC-XXXX-XXXX-XXXX` once and is in. Keys are generated with
+`secrets` over an unambiguous alphabet (no `0/O/1/I`), are single-transaction
+redeemed so two people cannot race the last use, and can carry an expiry.
+
+> Leaving `PC_ADMIN_IDS` unset keeps the bot open **and prints a warning at
+> startup** — a deploy cannot lock you out of your own bot by omission.
+
+Users, keys and expiry dates live in the same SQLite file as the vault, so they
+persist across restarts **only if the volume is mounted** (see below).
+
+## Country accuracy
+
+Geolocation is only as good as the exit IP it is given, so both halves are
+hardened:
+
+* **The exit IP must be real.** A judge that answers with an HTML error page or a
+  Cloudflare interstitial used to hand back *the CDN's* address as the proxy's
+  exit IP — which geolocates to US, so a Canadian proxy could be labelled 🇺🇸 US.
+  `extract_ip` now refuses markup and unreadable bodies, rejects loopback /
+  link-local / multicast addresses, and returns nothing rather than guessing.
+* **Two providers must agree.** Each newly resolved IP is spot-checked against a
+  second provider (bounded by `PC_GEO_VERIFY_MAX`). **On disagreement the country
+  becomes `❔ Unknown`, not a confident guess**, and the report says how many were
+  dropped. A disputed answer is never cached, so a later scan can resolve it.
+* **Answers carry context.** The cache stores city and ISP alongside the country,
+  so a datacenter misattribution is visible rather than mysterious.
+* **The cache expires.** `PC_GEO_TTL_DAYS` (default 7) controls how long an answer
+  is trusted, and expired entries are pruned instead of accumulating forever.
+  If your cache already holds wrong answers, run `/geoclear` (admin) and re-scan.
+
 ## Deployment
 
-### Railway (config included)
+### Railway — step by step
 
-1. Push the repo, then **New Project → Deploy from GitHub repo**.
-2. Add `TELEGRAM_BOT_TOKEN` under **Variables**.
-3. Railway builds and runs `telegram_proxy_bot.py` (`restartPolicyType: ALWAYS`).
+1. **Push the repo** to GitHub (already done if you are reading it there).
+2. In Railway: **New Project → Deploy from GitHub repo**, pick this repository.
+   Railway reads `railway.json`, builds with Railpack and runs
+   `python3 telegram_proxy_bot.py` with `restartPolicyType: ALWAYS`.
+3. **Add a volume before the first scan.** Open the service → **Variables/Volumes**
+   (right-click the service → **Attach Volume** in the canvas):
+   * Mount path: `/app/vault`
+   * Then add the variable `PC_VAULT_DIR=/app/vault`
+   Without this, the container filesystem is ephemeral and the vault, geo cache,
+   **users and redeem keys** are wiped on every deploy.
+4. **Set the variables** (service → **Variables → New Variable**):
+   * `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather) *(required)*
+   * `PC_ADMIN_IDS` — your Telegram user id, e.g. `123456789` *(recommended: locks
+     the bot to you and lets you mint keys)*
+   * optional tuning: `PC_THREADS`, `PC_GLOBAL_THREADS`, `PC_MAX_JOBS`,
+     `PC_TIMEOUT`, `PC_GEO_TTL_DAYS`, `PC_GEO_VERIFY_MAX`
+5. **Deploy**, then open **Logs**. On a healthy start you should see:
 
-> ⚠️ **Attach a volume** — mount it at `/app/vault` and set `PC_VAULT_DIR=/app/vault`, or the vault/geo cache are wiped on every deploy.
+   ```
+   PROXY CHECKER TELEGRAM BOT running. Press Ctrl+C to stop.
+   vault=/app/vault (0 pooled) · engine=thread · geo=on · jobs=4 · threads=300
+   access: restricted to 1 admin id(s) (PC_ADMIN_IDS) · 0 user(s) granted
+   ```
+
+   If it says `access: PC_ADMIN_IDS is not set — the bot is OPEN`, step 4 is
+   incomplete.
+6. **Smoke test**: message the bot `/start` from your admin account — you should
+   get the banner. From a second account you should get the private-bot notice.
+7. **Get in**: `/genkeys 3 1 7` then `/redeem` a key from whichever account you
+   want to use.
+
+> ⚠️ Two gotchas worth knowing: only **one** process may poll a token (a second
+> replica now logs `poll conflict 409` and exits instead of silently
+> busy-looping), and the free geo provider is HTTP-only — that is a provider
+> limitation, not a setting.
+
+### Heroku
+
+1. Rename `Procfile.txt` → `Procfile`.
+2. `heroku config:set TELEGRAM_BOT_TOKEN=... PC_ADMIN_IDS=...`
+3. Attach a volume equivalent or accept that the vault resets on restart.
 
 ### Heroku
 
@@ -237,7 +339,7 @@ Special buckets: `🚫 no exit IP` (proxy answered, judge gave no IP) and `🌐 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v      # 92 tests, no token, no internet
+python3 -m unittest discover -s tests -v      # 126 tests, no token, no internet
 ```
 
 The suite drives the **real engine against a mock HTTP proxy on localhost** (TCP gate, protocol attempts, both backends, judge-unreadable handling), and stubs only the Telegram API and the remote judge. It also covers country grouping, tier buttons, pagination, filters/sorting, export formats, vault SQLite + legacy migration, the job queue, the geo pipeline and the bot's full scan-to-report path. One optional smoke test hits ip-api.com and skips itself if offline.

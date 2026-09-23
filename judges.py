@@ -106,12 +106,16 @@ class JudgePool:
     def _probe(self, url: str) -> dict:
         started = time.time()
         try:
-            r = requests.get(url, timeout=self.timeout, headers=_UA)
+            # bounded_get enforces a *total* wall clock; requests' own timeout is
+            # per socket op, so a drip-feeding endpoint could otherwise hold this
+            # probe thread (and the health sweep) open far past self.timeout.
+            from engine import bounded_get
+            status, body = bounded_get(url, self.timeout)
             ms = (time.time() - started) * 1000
-            if r.status_code != 200:
+            if status != 200:
                 return {"ok": False, "ms": ms, "ip": "", "ts": time.time(),
-                        "err": f"HTTP {r.status_code}"}
-            ip = extract_ip(r.text)
+                        "err": f"HTTP {status}"}
+            ip = extract_ip(body)
             if not ip:
                 return {"ok": False, "ms": ms, "ip": "", "ts": time.time(),
                         "err": "unreadable body"}
@@ -235,11 +239,12 @@ class JudgePool:
 
 def fetch_exit_ip(judge: str, proxies: dict, timeout: int) -> tuple:
     """Fetch the exit IP through `proxies` -> (ip, err). '' + reason on failure."""
+    from engine import bounded_get
     try:
-        r = requests.get(judge, proxies=proxies, timeout=timeout, headers=_UA)
+        status, body = bounded_get(judge, timeout, proxies)
     except Exception as e:
         return "", type(e).__name__
-    if r.status_code != 200:
-        return "", f"HTTP {r.status_code}"
-    ip = extract_ip(r.text)
+    if status != 200:
+        return "", f"HTTP {status}"
+    ip = extract_ip(body)
     return ip, ("" if ip else "JudgeUnreadable")

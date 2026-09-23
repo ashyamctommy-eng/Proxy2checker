@@ -125,7 +125,9 @@ def filter_records(records, view):
     out = list(records or [])
 
     if view.get("only_anon"):
-        out = [r for r in out if r.get("st") != "TRANSPARENT"]
+        # "anon" means *proven* anonymous: both transparent (proven leak) and
+        # unknown (leak never verified) are excluded.
+        out = [r for r in out if r.get("st") not in ("TRANSPARENT", "UNKNOWN")]
     if view.get("max_lat") is not None:
         out = [r for r in out if _lat(r) <= view["max_lat"]]
     if view.get("proto"):

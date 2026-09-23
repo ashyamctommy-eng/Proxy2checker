@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures as cf
+import ipaddress
 import re
 import socket
 import time
@@ -47,10 +48,13 @@ import requests
 
 from judges import JudgePool, extract_ip
 
-PROTOS = ("http", "https", "socks4", "socks5")
+MAX_BODY_BYTES = 64 * 1024      # judge bodies are tiny; a huge one is hostile
 # Order for scheme-less lines: the scheme that resolves a case soonest comes
 # first, so a working proxy stops the chain early instead of walking all four.
 PROTO_ORDER_AUTO = ("http", "socks5", "socks4", "https")
+# Kept as the public name of that order for backwards compatibility; it used to
+# hold the *old* sequence, so anything iterating it got the pre-fix order.
+PROTOS = PROTO_ORDER_AUTO
 _PROTO_RE = re.compile(r"^(https?|socks4a?|socks5h?)://", re.I)
 _UA = {"User-Agent": "proxy-checker/1.0"}
 JUDGE_UNREADABLE = "JudgeUnreadable"
@@ -80,9 +84,26 @@ def parse_proxy(line, default_proto="http"):
             creds_user, creds_pass = cred.split(":", 1)
         else:
             creds_user = cred
-        parts = hostpart.split(":")
     else:
-        parts = rest.split(":")
+        hostpart = rest
+
+    # Host section: IPv6 literals must be bracketed, e.g. [2001:db8::1]:8080.
+    # A bare IPv6 host is ambiguous with `host:port`, so it is rejected rather
+    # than silently mis-parsed (`::1:8080` used to become host="1").
+    if hostpart.startswith("["):
+        end = hostpart.find("]")
+        if end < 0 or not hostpart[end + 1:].startswith(":"):
+            return None
+        host_lit = hostpart[1:end]
+        try:
+            ipaddress.IPv6Address(host_lit)
+        except ValueError:
+            return None
+        parts = [host_lit] + hostpart[end + 2:].split(":")
+    else:
+        if "::" in hostpart:
+            return None
+        parts = hostpart.split(":")
 
     # 4-part lines: host:port:user:pass  vs  user:pass:host:port — the numeric
     # port position disambiguates them.
@@ -109,13 +130,22 @@ def parse_proxy(line, default_proto="http"):
             "user": creds_user, "pass": creds_pass, "raw": line}
 
 
+def is_ipv6(host: str) -> bool:
+    return ":" in host
+
+
+def hostport(host: str, port) -> str:
+    """Render host:port, bracketing IPv6 literals the way URLs require."""
+    return f"[{host}]:{port}" if is_ipv6(host) else f"{host}:{port}"
+
+
 def proxy_url(p, proto=None):
     proto = proto or p["proto"]
     scheme = "socks5h" if proto == "socks5" else ("socks4a" if proto == "socks4" else proto)
     auth = ""
     if p["user"]:
         auth = p["user"] + (":" + p["pass"] if p["pass"] else "") + "@"
-    return f"{scheme}://{auth}{p['host']}:{p['port']}"
+    return f"{scheme}://{auth}{hostport(p['host'], p['port'])}"
 
 
 def canonical(p, proto):
@@ -144,7 +174,10 @@ def attempt_timeout(timeout, index):
     """
     if index == 0:
         return timeout
-    return max(3.0, float(timeout) / 2.0)
+    # A shorter probe for the fallbacks — but never *longer* than the first
+    # guess (max(3, timeout/2) made fallbacks slower than the primary whenever
+    # timeout <= 6s, i.e. exactly the fast-scan settings users pick).
+    return min(float(timeout), max(3.0, float(timeout) / 2.0))
 
 
 # -------------------------------------------------------------- tcp gate -----
@@ -167,6 +200,47 @@ def tcp_probe(host, port, timeout):
 
 
 # ---------------------------------------------------------- single check -----
+def bounded_get(url, total, proxies=None, headers=None):
+    """GET with a *total* wall-clock deadline and a bounded body.
+
+    `requests`' timeout is per socket operation (connect, then read-between-
+    bytes), so a proxy or judge that dribbles one byte just under each read
+    timeout pins the worker forever. That is a real stall - not a leak - and in
+    the thread backend it wedges the scan, the job's thread and its slot in the
+    global job queue. We therefore stream the body and stop on wall clock, and
+    cap how much we are willing to read (a hostile judge cannot OOM us).
+    """
+    total = max(1.0, float(total))
+    started = time.monotonic()
+    # Keep the historical per-attempt budget as the per-read timeout so latency
+    # semantics for slow-but-working proxies are unchanged; the wall-clock check
+    # below is what bounds the pathological drip-feed case.
+    per_op = total
+    r = requests.get(url, proxies=proxies, headers=headers or _UA,
+                     timeout=(min(5.0, per_op), per_op), stream=True)
+    try:
+        chunks, size = [], 0
+        # Read a byte at a time *on purpose*. urllib3's read(n) loops on recv
+        # until it has n bytes, so a larger chunk size means the loop body below
+        # never runs while a drip-feeding peer trickles data in — and the
+        # per-read timeout never fires because every recv() succeeds. Byte-wise
+        # reads guarantee the wall-clock check is reached.
+        for chunk in r.iter_content(1):
+            if not chunk:
+                continue
+            if time.monotonic() - started > total:
+                raise requests.exceptions.Timeout("total deadline exceeded")
+            chunks.append(chunk)
+            size += len(chunk)
+            if size >= MAX_BODY_BYTES:
+                break
+        body = b"".join(chunks)[:MAX_BODY_BYTES]
+        return r.status_code, body.decode("utf-8", "replace")
+    finally:
+        r.close()
+
+
+# ---------------------------------------------------------- single check -----
 def check_one(p, default_proto, timeout, judge, tcp_gate=True):
     """Check one proxy -> (ok, proto_used, latency_ms, exit_ip, err)."""
     if tcp_gate:
@@ -180,13 +254,12 @@ def check_one(p, default_proto, timeout, judge, tcp_gate=True):
         proxies = {"http": url, "https": url}
         try:
             t0 = time.time()
-            r = requests.get(judge, proxies=proxies, timeout=attempt_timeout(timeout, index),
-                             headers=_UA)
-            if r.status_code == 200:
-                ip = extract_ip(r.text)
+            status, body = bounded_get(judge, attempt_timeout(timeout, index), proxies)
+            if status == 200:
+                ip = extract_ip(body)
                 return True, proto, (time.time() - t0) * 1000, ip, \
                     ("" if ip else JUDGE_UNREADABLE)
-            last_err = f"HTTP {r.status_code}"
+            last_err = f"HTTP {status}"
         except Exception as e:
             last_err = type(e).__name__
     return False, None, None, None, last_err
@@ -259,37 +332,43 @@ def _check_async(items, proto, timeout, judge, judge_pool, threads, on_result, t
     import aiohttp
 
     async def gate(host, port):
+        writer = None
         try:
             started = time.perf_counter()
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, int(port)), timeout=gate_timeout(timeout))
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
             return True, (time.perf_counter() - started) * 1000, ""
         except asyncio.TimeoutError:
             return False, None, "TCP timeout"
         except Exception as e:
             return False, None, f"TCP {type(e).__name__}"
+        finally:
+            # wait_for() can fire *after* the transport exists; without this the
+            # socket is orphaned. Closing is safe even when the gate succeeded.
+            if writer is not None:
+                writer.close()
 
     def sync_attempt(p, one_proto, one_judge, one_timeout):
         url = proxy_url(p, one_proto)
         proxies = {"http": url, "https": url}
         try:
             t0 = time.time()
-            r = requests.get(one_judge, proxies=proxies, timeout=one_timeout, headers=_UA)
-            if r.status_code == 200:
-                ip = extract_ip(r.text)
+            status, body = bounded_get(one_judge, one_timeout, proxies)
+            if status == 200:
+                ip = extract_ip(body)
                 return True, one_proto, (time.time() - t0) * 1000, ip, \
                     ("" if ip else JUDGE_UNREADABLE)
-            return False, one_proto, None, None, f"HTTP {r.status_code}"
+            return False, one_proto, None, None, f"HTTP {status}"
         except Exception as e:
             return False, one_proto, None, None, type(e).__name__
 
     async def attempt(session, p, one_proto, one_judge, socks_pool, one_timeout):
-        if one_proto in ("socks4", "socks5") and not socks_async_available():
+        # SOCKS always goes through the thread pool. aiohttp's ClientSession only
+        # speaks HTTP CONNECT; a `socks5h://` URL needs aiohttp_socks.ProxyConnector,
+        # which this engine does not build. The old guard ran socks *here* when
+        # aiohttp_socks was installed - i.e. installing the optional dependency
+        # made every SOCKS proxy report dead.
+        if one_proto in ("socks4", "socks5"):
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(socks_pool, sync_attempt, p, one_proto,
                                               one_judge, one_timeout)

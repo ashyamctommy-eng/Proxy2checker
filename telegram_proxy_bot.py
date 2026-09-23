@@ -48,8 +48,8 @@ from collections import Counter, deque
 
 import requests
 
-from engine import parse_proxy, check_many, resolve_engine, JUDGE_UNREADABLE
-from judges import JudgePool
+from engine import parse_proxy, check_many, resolve_engine, JUDGE_UNREADABLE, bounded_get
+from judges import JudgePool, extract_ip
 from geoip import (GeoDB, GeoPipeline, clean_ip, flag_emoji,
                    UNKNOWN_CC, UNKNOWN_NAME, NO_IP_CC, NO_IP_NAME)
 from vault import Vault
@@ -119,8 +119,13 @@ JUDGES = JudgePool(timeout=min(TIMEOUT, 8))
 QUEUE = JobQueue(max_jobs=MAX_JOBS, global_threads=GLOBAL_THREADS,
                  min_threads=max(8, GLOBAL_THREADS // (MAX_JOBS * 2)))
 
-STATUS_ICON = {"OK": "🔒", "TRANSPARENT": "🚩", "FLAGGED": "⚠"}
-SCORE_MULT = {"OK": 1.0, "TRANSPARENT": 0.6, "FLAGGED": 0.35}
+# UNKNOWN = the proxy answered and gave an exit IP, but we could not learn this
+# host's own IP, so transparent-vs-anonymous could not be decided. It is a
+# distinct state: previously this silently fell through to "OK", so every proxy
+# was advertised as anonymous (and scored 1.0) whenever the judge was unreachable
+# from the bot itself.
+STATUS_ICON = {"OK": "🔒", "TRANSPARENT": "🚩", "FLAGGED": "⚠", "UNKNOWN": "❔"}
+SCORE_MULT = {"OK": 1.0, "UNKNOWN": 0.75, "TRANSPARENT": 0.6, "FLAGGED": 0.35}
 TIER_LEGEND = "🟢 ≥25% · 🟡 ≥10% · 🟠 ≥3% · 🔴 under 3%"
 
 BANNER = (
@@ -374,6 +379,13 @@ def human_eta(seconds):
 
 
 # ---------------------------------------------------------------- telegram ---
+def _redact(text):
+    """The API URL embeds the bot token, and requests' exception strings contain
+    the URL — so an unredacted log line hands over full control of the bot."""
+    text = str(text)
+    return text.replace(TOKEN, "<token>") if TOKEN else text
+
+
 def api(method, **params):
     """Call the Bot API, honouring 429 retry_after instead of dropping updates."""
     data = {}
@@ -382,7 +394,7 @@ def api(method, **params):
             r = requests.post(f"{API}/{method}", data=params, timeout=60)
             data = r.json()
         except Exception as e:
-            print("api err", method, e)
+            print("api err", method, _redact(e))
             return {}
         if isinstance(data, dict) and data.get("error_code") == 429:
             if attempt == 2:
@@ -420,7 +432,7 @@ def send_doc(chat_id, filename, data, caption="", markup=None):
         return requests.post(f"{API}/sendDocument", data=payload, files=files,
                              timeout=120).json()
     except Exception as e:
-        print("send_doc err", e)
+        print("send_doc err", _redact(e))
         return {}
 
 
@@ -432,7 +444,7 @@ def download_file(file_id):
             return None
         return requests.get(f"{FILE_API}/{path}", timeout=120).content
     except Exception as e:
-        print("download err", e)
+        print("download err", _redact(e))
         return None
 
 
@@ -693,11 +705,9 @@ def fetch_real_ip():
     """This host's own IP, via the judge pool (so transparent proxies stand out)."""
     judge = JUDGE_OVERRIDE or JUDGES.pick()
     try:
-        r = requests.get(judge, timeout=min(TIMEOUT, 6),
-                         headers={"User-Agent": "proxy-checker/1.0"})
-        if r.status_code == 200:
-            from judges import extract_ip
-            ip = extract_ip(r.text)
+        status, body = bounded_get(judge, min(TIMEOUT, 6))
+        if status == 200:
+            ip = extract_ip(body)
             if ip:
                 return ip
     except Exception:
@@ -711,7 +721,10 @@ def classify_status(exit_ip, real_ip):
     if not exit_ip:
         return "FLAGGED"
     real = clean_ip(real_ip)
-    if real and clean_ip(exit_ip) == real:
+    if not real:
+        # We never learned our own IP, so we cannot claim this proxy is anonymous.
+        return "UNKNOWN"
+    if clean_ip(exit_ip) == real:
         return "TRANSPARENT"
     return "OK"
 
@@ -883,6 +896,13 @@ def _run_job(chat_id, lines, threads=None):
     if not judge_warning and results and unreadable[0] / max(1, len(results)) > JUDGE_WARN_RATIO:
         JUDGES.check_health(force=True)
         judge_warning = JUDGES.status_line()
+    if not real_ip:
+        # Without our own IP every proxy lands in UNKNOWN, so leak detection is
+        # off for this run. Say so instead of presenting them as anonymous.
+        anon_warning = ("❔ Could not determine this host's own IP — leak detection "
+                        "is unavailable, so anonymous/transparent is unverified "
+                        "(shown as ❔ UNKNOWN).")
+        judge_warning = f"{judge_warning}\n{anon_warning}" if judge_warning else anon_warning
 
     scan_id = new_scan_id()
     meta = {"total": total, "valid": len(records), "elapsed": round(elapsed, 1),
@@ -1351,29 +1371,68 @@ def handle_update(upd):
             _start_job(chat_id, lines)
 
 
+def poll_error_action(error_code, conflicts):
+    """Decide what to do with a failed getUpdates response.
+
+    Returns (action, sleep_seconds, conflicts) where action is "retry" or "exit".
+    Telegram returns failures as a body (ok=false, error_code=...), so a 409 from
+    a second instance used to look like "no updates" and spin the loop flat out.
+    """
+    if error_code == 409:
+        conflicts += 1
+        if conflicts >= 5:
+            return "exit", 0, conflicts
+        return "retry", min(5 * conflicts, 30), conflicts
+    if error_code in (401, 403):
+        return "exit", 0, conflicts
+    return "retry", 3, conflicts
+
+
 def main():
     print("PROXY CHECKER TELEGRAM BOT running. Press Ctrl+C to stop.")
     print(f"vault={VAULT_DIR} ({VAULT.pool_size()} pooled) · engine={resolve_engine(ENGINE_MODE)} "
           f"· geo={'on' if GEO_ENABLED else 'off'} · jobs={MAX_JOBS} · "
           f"threads={GLOBAL_THREADS}")
     JUDGES.check_health_async()
-    api("deleteWebhook", drop_pending_updates="false")
+    # No drop_pending_updates: the default is false, and passing the *string*
+    # "false" risked being coerced truthy (silently discarding updates) or being
+    # rejected invisibly.
+    api("deleteWebhook")
     offset = None
+    conflicts = 0
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
                              params={"timeout": 30, "offset": offset}, timeout=40).json()
+
+            # Telegram reports failures as a JSON *body* (ok=false, error_code=...),
+            # not an exception. Without this check a 409 (another instance or a
+            # rolling deploy's overlap) silently yields no updates and the loop
+            # re-polls in a tight loop — the process stays alive and looks healthy
+            # to the platform's restart policy while serving nobody.
+            if not isinstance(r, dict) or not r.get("ok", True):
+                code = r.get("error_code") if isinstance(r, dict) else None
+                desc = r.get("description", "") if isinstance(r, dict) else ""
+                action, wait, conflicts = poll_error_action(code, conflicts)
+                if action == "exit":
+                    print(f"fatal poll error {code}: {_redact(desc)} — exiting")
+                    sys.exit(1)
+                print("poll error", code, _redact(desc))
+                time.sleep(wait)
+                continue
+
+            conflicts = 0
             for upd in r.get("result", []):
                 offset = upd["update_id"] + 1
                 try:
                     handle_update(upd)
                 except Exception as e:
-                    print("handler err", e)
+                    print("handler err", _redact(e))
         except KeyboardInterrupt:
             print("\nStopped.")
             break
         except Exception as e:
-            print("poll err", e)
+            print("poll err", _redact(e))
             time.sleep(3)
 
 

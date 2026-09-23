@@ -61,6 +61,12 @@ def _scheme(proto):
     return {"socks5": "socks5", "socks4": "socks4"}.get(proto, proto or "http")
 
 
+def _hostport(host, port):
+    """Bracket IPv6 literals; a bare `2001:db8::1:8080` is not a valid host:port."""
+    host = str(host)
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def format_record(record, fmt="raw"):
     """Render one record in the requested format (falls back to raw)."""
     fmt = fmt if fmt in FORMATS else "raw"
@@ -73,6 +79,18 @@ def format_record(record, fmt="raw"):
         return raw                     # unparseable line: never lose it
     proto, host, port, user, pwd = parsed
 
+    # A credential with no password (`user@host:port`) leaves pwd as None; naive
+    # f-string interpolation used to export the literal string "None" into the
+    # user's file (`http://user:None@...`). Render the user-only form instead.
+    if user and pwd is None:
+        auth = f"{user}@"
+        cred = user
+    elif user:
+        auth = f"{user}:{pwd}@"
+        cred = f"{user}:{pwd}"
+    else:
+        auth = cred = ""
+
     if fmt == "json":
         return {
             "host": host, "port": port, "proto": _scheme(proto),
@@ -81,14 +99,13 @@ def format_record(record, fmt="raw"):
             "latency_ms": record.get("lat"), "score": record.get("sc"),
         }
     if fmt == "ip:port":
-        return f"{host}:{port}"
+        return _hostport(host, port)
     if fmt == "host:port:user:pass":
-        return f"{host}:{port}:{user}:{pwd}" if user else f"{host}:{port}"
+        return f"{_hostport(host, port)}:{cred}" if cred else _hostport(host, port)
     if fmt == "user:pass@host:port":
-        return f"{user}:{pwd}@{host}:{port}" if user else f"{host}:{port}"
+        return f"{auth}{_hostport(host, port)}" if auth else _hostport(host, port)
     if fmt == "url":
-        auth = f"{user}:{pwd}@" if user else ""
-        return f"{_scheme(proto)}://{auth}{host}:{port}"
+        return f"{_scheme(proto)}://{auth}{_hostport(host, port)}"
     return raw
 
 

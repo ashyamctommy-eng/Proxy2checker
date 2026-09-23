@@ -1376,6 +1376,196 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(got["country"], "Germany")
 
 
+class DripFeedServer:
+    """A server that sends a valid 200 header, then one byte at a time forever.
+
+    This is the pathological case `requests`' per-socket timeout cannot bound:
+    every individual read succeeds, so the request never ends.
+    """
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self._stop = False
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
+            while not self._stop:
+                conn.sendall(b"x")
+                time.sleep(0.2)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class AutonomyHardeningTests(unittest.TestCase):
+    """Regressions for the bugs fixed on fix/autonomy-hardening."""
+
+    def test_cli_module_imports_and_loads_input(self):
+        """proxy_checker.py had zero test coverage, so a change to engine's
+        public names (PROTOS) broke the CLI without failing a single test."""
+        import importlib
+        pc = importlib.import_module("proxy_checker")
+        self.assertEqual(pc.PROTOS, engine.PROTO_ORDER_AUTO)
+        path = os.path.join(TMP, "cli-input.txt")
+        with open(path, "w") as fh:
+            fh.write("1.2.3.4:8080\n\n# comment\n\n5.6.7.8:3128\n")
+        lines = pc.load_input([path])
+        self.assertIn("1.2.3.4:8080", lines)
+        self.assertIn("5.6.7.8:3128", lines)
+
+    # ---- anonymity must not be asserted when it cannot be verified ----------
+    def test_status_is_unknown_when_our_own_ip_is_unknown(self):
+        self.assertEqual(bot.classify_status("203.0.113.9", None), "UNKNOWN")
+        self.assertEqual(bot.classify_status("203.0.113.9", ""), "UNKNOWN")
+        self.assertEqual(bot.classify_status("203.0.113.9", "203.0.113.9"), "TRANSPARENT")
+        self.assertEqual(bot.classify_status("203.0.113.9", "198.51.100.9"), "OK")
+        self.assertEqual(bot.classify_status(None, "198.51.100.9"), "FLAGGED")
+
+    def test_unknown_scores_below_verified_anonymous_but_above_transparent(self):
+        self.assertGreater(bot.score_of(150, "OK"), bot.score_of(150, "UNKNOWN"))
+        self.assertGreater(bot.score_of(150, "UNKNOWN"), bot.score_of(150, "TRANSPARENT"))
+        self.assertGreater(bot.score_of(150, "TRANSPARENT"), bot.score_of(150, "FLAGGED"))
+        for st in bot.SCORE_MULT:
+            self.assertIn(st, bot.STATUS_ICON)
+
+    def test_anon_filter_excludes_unverified(self):
+        recs = [{"raw": "a:1", "lat": 10.0, "st": "OK", "sc": 90},
+                {"raw": "b:1", "lat": 20.0, "st": "UNKNOWN", "sc": 90},
+                {"raw": "c:1", "lat": 30.0, "st": "TRANSPARENT", "sc": 60}]
+        view = ui.reset_view("c-anon", "abcdef01")
+        view["only_anon"] = True
+        out = ui.filter_records(recs, view)
+        self.assertEqual([r["raw"] for r in out], ["a:1"])
+
+    # ---- exports -----------------------------------------------------------
+    def test_export_never_emits_a_literal_none_credential(self):
+        p = engine.parse_proxy("user@1.2.3.4:8080")
+        self.assertEqual(p["user"], "user")
+        self.assertIsNone(p["pass"])
+        for fmt in ("url", "u:p@h:p", "host:port:user:pass", "ip:port"):
+            out = formats.format_record(p, fmt)
+            self.assertIsInstance(out, str)
+            self.assertNotIn("None", out, f"{fmt} leaked a literal None: {out}")
+
+    # ---- IPv6 --------------------------------------------------------------
+    def test_bracketed_ipv6_round_trips(self):
+        p = engine.parse_proxy("[2001:db8::1]:8080")
+        self.assertIsNotNone(p)
+        self.assertEqual(p["host"], "2001:db8::1")
+        self.assertEqual(p["port"], 8080)
+        self.assertEqual(engine.proxy_url(p), "http://[2001:db8::1]:8080")
+        self.assertEqual(formats.format_record(p, "ip:port"), "[2001:db8::1]:8080")
+
+    def test_bare_ipv6_is_rejected_not_misparsed(self):
+        # `::1:8080` used to parse as host="1" — a silent wrong check.
+        for bad in ("::1:8080", "2001:db8::1:8080", "[not-an-ip]:8080", "[2001:db8::1]"):
+            self.assertIsNone(engine.parse_proxy(bad), bad)
+
+    # ---- timeouts ----------------------------------------------------------
+    def test_fallback_timeout_never_exceeds_the_primary(self):
+        for t in (1, 2, 3, 5, 6, 8, 10, 30):
+            self.assertEqual(engine.attempt_timeout(t, 0), t)
+            self.assertLessEqual(engine.attempt_timeout(t, 1), t, f"timeout={t}")
+
+    def test_bounded_get_enforces_a_total_deadline(self):
+        srv = DripFeedServer()
+        try:
+            started = time.monotonic()
+            with self.assertRaises(Exception):
+                engine.bounded_get(f"http://127.0.0.1:{srv.port}/", 1.0)
+            elapsed = time.monotonic() - started
+        finally:
+            srv.close()
+        # Before the fix this never returned: requests' timeout is per socket op,
+        # and every individual read succeeded.
+        self.assertLess(elapsed, 8.0, "bounded_get did not bound the total time")
+
+    def test_bounded_get_caps_a_huge_body(self):
+        size = engine.MAX_BODY_BYTES * 3
+        body = b"A" * size
+
+        class BigHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), BigHandler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            status, text = engine.bounded_get(
+                f"http://127.0.0.1:{httpd.server_address[1]}/", 10.0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(text), engine.MAX_BODY_BYTES)
+
+    # ---- poll lifetime -----------------------------------------------------
+    def test_poll_error_action_backs_off_then_exits_on_repeated_409(self):
+        conflicts = 0
+        for _ in range(4):
+            action, wait, conflicts = bot.poll_error_action(409, conflicts)
+            self.assertEqual(action, "retry")
+            self.assertGreater(wait, 0)
+        action, _wait, _c = bot.poll_error_action(409, conflicts)
+        self.assertEqual(action, "exit")      # give up so the platform restarts
+
+    def test_poll_error_action_exits_on_auth_failure(self):
+        self.assertEqual(bot.poll_error_action(401, 0)[0], "exit")
+        self.assertEqual(bot.poll_error_action(403, 0)[0], "exit")
+        self.assertEqual(bot.poll_error_action(400, 0), ("retry", 3, 0))
+
+    def test_token_is_redacted_from_logs(self):
+        token = bot.TOKEN
+        # requests' exception strings embed the request URL, which embeds the token.
+        leaked = bot._redact(f"HTTPSConnectionPool https://api.telegram.org/bot{token}/getUpdates")
+        self.assertNotIn(token, leaked)
+        self.assertIn("<token>", leaked)
+
+    # ---- async engine ------------------------------------------------------
+    def test_async_socks_is_not_routed_into_an_aiohttp_socks_url(self):
+        """aiohttp cannot speak a socks5h:// proxy URL without aiohttp_socks'
+        ProxyConnector, which this engine never builds. The old guard delegated to
+        the thread pool only when aiohttp_socks was *absent*, so installing the
+        optional dependency made every SOCKS proxy report dead."""
+        import inspect
+        src = inspect.getsource(engine._check_async)
+        self.assertNotIn("not socks_async_available()", src)
+        self.assertIn('if one_proto in ("socks4", "socks5"):', src)
+
+
 class RealNetworkSmokeTest(unittest.TestCase):
     """Only test that touches the internet; skips itself when unavailable."""
 
